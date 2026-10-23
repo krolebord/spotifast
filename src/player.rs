@@ -391,6 +391,8 @@ pub struct Engine {
     /// Connect device of its own (`crate::soloist`). Soloist outlives this
     /// engine: the backend's slot holds it across librespot's reconnects.
     soloist: Option<Arc<crate::soloist::Soloist>>,
+    /// Edits Soloist's queue over Connect, which its own API cannot.
+    soloist_queue: Option<crate::soloist::queue::Writer>,
     /// librespot's player's own state. The interface reads `state`, which is
     /// this one unless Soloist plays.
     librespot_state: Arc<Mutex<LocalState>>,
@@ -531,16 +533,7 @@ impl Engine {
         let soloist = match &soloist_config {
             None => None,
             Some(soloist_config) => {
-                match Self::adopt_soloist(
-                    config,
-                    soloist_config,
-                    &session,
-                    &credentials,
-                    &notify,
-                    &slot,
-                )
-                .await
-                {
+                match Self::adopt_soloist(config, soloist_config, &session, &notify, &slot).await {
                     Ok(soloist) => Some(soloist),
                     Err(error) => {
                         shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -573,12 +566,22 @@ impl Engine {
             Some(soloist) => (soloist.device_id().to_string(), soloist.state()),
             None => (config.device_id(), Arc::clone(&librespot_state)),
         };
+        // librespot's idle device is told Soloist's queue, revision included.
+        let soloist_queue = soloist.as_ref().map(|soloist| {
+            crate::soloist::queue::Writer::spawn(
+                session.clone(),
+                soloist.device_id().to_string(),
+                spirc.watch_player_state(),
+                spirc.watch_cluster_state(),
+            )
+        });
         Ok(Self {
             player,
             spirc: Arc::new(spirc),
             mixer,
             audio,
             soloist,
+            soloist_queue,
             librespot_state,
             session,
             device_id,
@@ -597,7 +600,6 @@ impl Engine {
         config: &EngineConfig,
         soloist_config: &crate::soloist::SoloistConfig,
         session: &Session,
-        credentials: &Credentials,
         notify: &Notify,
         slot: &crate::soloist::Slot,
     ) -> Result<Arc<crate::soloist::Soloist>> {
@@ -615,13 +617,6 @@ impl Engine {
         if let Some(previous) = running.take() {
             previous.soloist.shutdown();
         }
-        // Also the credential Soloist is paired with, when it has none.
-        let access_token = session
-            .login5()
-            .auth_token()
-            .await
-            .ok()
-            .map(|token| token.access_token);
         let state = Arc::new(Mutex::new(LocalState {
             volume: config.initial_volume,
             connected: true,
@@ -633,8 +628,6 @@ impl Engine {
                 soloist_config,
                 &name,
                 config.initial_volume,
-                credentials,
-                access_token,
                 state,
                 Arc::clone(notify),
             )
@@ -979,12 +972,20 @@ impl Engine {
 }
 
 impl Engine {
-    /// A command for Soloist, through its API or, for loads, Connect.
+    fn soloist_queue(&self) -> Result<&crate::soloist::queue::Writer> {
+        self.soloist_queue
+            .as_ref()
+            .context("Spotify Soloist's queue cannot be changed")
+    }
+
+    /// A command for Soloist, through its API or, for the queue and loads,
+    /// Connect.
     fn send_soloist(
         &self,
         soloist: &Arc<crate::soloist::Soloist>,
         command: PlayerCommand,
     ) -> Result<()> {
+        use crate::soloist::queue::Op;
         use serde_json::json;
         match command {
             PlayerCommand::Toggle => {
@@ -1003,14 +1004,12 @@ impl Engine {
             }
             PlayerCommand::Next => soloist.send("skip_next", json!({}))?,
             PlayerCommand::Previous => soloist.send("skip_prev", json!({}))?,
-            PlayerCommand::ClearQueue => {
-                anyhow::bail!("Spotify Soloist cannot clear the queue")
-            }
+            PlayerCommand::ClearQueue => self.soloist_queue()?.send(Op::Clear)?,
             PlayerCommand::AddToQueue(uri) => {
-                if crate::util::uri_kind(&uri) != Some("track") {
-                    anyhow::bail!("Spotify Soloist can only queue songs");
+                if !matches!(crate::util::uri_kind(&uri), Some("track" | "episode")) {
+                    anyhow::bail!("Spotify Soloist can only queue songs and episodes");
                 }
-                soloist.send("add_to_queue", json!({ "uri": uri }))?;
+                self.soloist_queue()?.send(Op::Add(uri))?;
             }
             PlayerCommand::Seek(position_ms) => {
                 soloist.send("seek", json!({ "position_ms": position_ms }))?;

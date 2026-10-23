@@ -158,7 +158,11 @@ counts once, and the notification reports only the rows actually added.
     the end, exactly like **Add to queue**. *Next up* is never a drop
     target: it plays from the current context, not from a list Spotifast
     can rewrite. While *Playing next* is empty, drop the song on the player
-    bar's Queue button instead.
+    bar's Queue button instead. With Spotify Soloist as the player, the
+    same clear and re-add reaches Soloist over Spotify Connect: Spotifast
+    appends the songs Soloist lacks, then sets the whole queue in its new
+    order in one step, so Soloist can also clear the queue and queue
+    episodes.
 
 12. **A song you queued can be removed on its own, only on this
     computer.** Right-click a row under *Playing next*, or open its **…**

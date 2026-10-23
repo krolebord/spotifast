@@ -28,6 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::api::models::ArtistRef;
 use crate::player::{EngineEvent, LoadSpec, LocalState, LocalTrack, Notify, Playback, RepeatMode};
 
+pub mod queue;
+
 /// The executable's file name.
 pub const BINARY: &str = if cfg!(windows) {
     "soloist.exe"
@@ -41,10 +43,6 @@ const EXIT_EXPIRED: i32 = 10;
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a restored session may take to report itself logged in.
 const RESTORE_WAIT: Duration = Duration::from_secs(4);
-/// How long pairing may take once the account was handed over.
-const PAIR_TIMEOUT: Duration = Duration::from_secs(10);
-/// ZeroConf browse length when looking for our own Soloist.
-const BROWSE: Duration = Duration::from_secs(3);
 /// Where Soloist keeps its Connect device id, in its data directory.
 const DEVICE_ID_FILE: &str = ".device_id";
 /// Volume drags are forwarded at most this often.
@@ -153,14 +151,12 @@ pub struct Soloist {
 }
 
 impl Soloist {
-    /// Starts Soloist, connects to its API and makes sure it is signed in
-    /// as the playback account. Its events update `state` from then on.
+    /// Starts Soloist, connects to its API and waits for its stored
+    /// session. Its events update `state` from then on.
     pub async fn start(
         config: &SoloistConfig,
         device_name: &str,
         initial_volume: u16,
-        credentials: &librespot_core::authentication::Credentials,
-        access_token: Option<String>,
         state: Arc<Mutex<LocalState>>,
         notify: Notify,
     ) -> Result<Self> {
@@ -194,9 +190,6 @@ impl Soloist {
             .arg(&key)
             .arg("--data-dir")
             .arg(&config.data_dir)
-            // Verbose output is the only place Soloist names its ZeroConf
-            // endpoint, which pairing needs; the rest is filtered out.
-            .arg("--verbose")
             .arg("--ws")
             .arg("127.0.0.1:0")
             .arg("--initial-volume")
@@ -208,6 +201,9 @@ impl Soloist {
             // on (`Soloist::shutdown`), and a watchdog stops it if this
             // process dies first; a kill on drop would cut that short.
             .kill_on_drop(cfg!(not(unix)));
+        if verbose() {
+            command.arg("--verbose");
+        }
         if let Some(cache) = &config.cache_dir {
             command.arg("--cache-dir").arg(cache);
             if let Some(mb) = config.cache_mb {
@@ -221,13 +217,11 @@ impl Soloist {
         if let Some(pid) = pid {
             watch_parent(pid);
         }
-        let (zeroconf_tx, zeroconf) = watch::channel(None::<(u16, String)>);
-        let zeroconf_tx = Arc::new(zeroconf_tx);
         if let Some(out) = child.stdout.take() {
-            tokio::spawn(forward_log(out, key.clone(), Arc::clone(&zeroconf_tx)));
+            tokio::spawn(forward_log(out, key.clone()));
         }
         if let Some(err) = child.stderr.take() {
-            tokio::spawn(forward_log(err, key.clone(), zeroconf_tx));
+            tokio::spawn(forward_log(err, key.clone()));
         }
         drop(key);
 
@@ -357,25 +351,15 @@ impl Soloist {
             ended,
             last_preview: Mutex::new(None),
         };
-        match soloist
-            .sign_in(
-                config,
-                device_name,
-                credentials,
-                access_token,
-                &mut auth,
-                zeroconf,
-            )
-            .await
-        {
+        match soloist.sign_in(config, &mut auth).await {
             Ok((device_id, paired)) => {
                 soloist.device_id = device_id;
                 if !paired {
-                    // Soloist keeps waiting; a pick in Spotify's own app
-                    // pairs it, and its sign-in event clears this.
+                    // Soloist keeps waiting; pairing it once from Terminal
+                    // stores a session, and its sign-in event clears this.
                     let snapshot = {
                         let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
-                        current.error = Some(pairing_needed(device_name));
+                        current.error = Some(pairing_needed(&binary, config, device_name));
                         current.clone()
                     };
                     notify(EngineEvent::State(snapshot));
@@ -389,16 +373,14 @@ impl Soloist {
         }
     }
 
-    /// Waits for a stored session, pairs over ZeroConf without one, and
-    /// returns Soloist's Connect device id.
+    /// Waits for a stored session and returns Soloist's Connect device id,
+    /// and whether it signed in. Spotifast does not pair Soloist itself:
+    /// handing it the playback account over ZeroConf did not work, so an
+    /// unpaired Soloist waits to be paired once from Terminal.
     async fn sign_in(
         &self,
         config: &SoloistConfig,
-        device_name: &str,
-        credentials: &librespot_core::authentication::Credentials,
-        access_token: Option<String>,
         auth: &mut watch::Receiver<Option<bool>>,
-        mut zeroconf: watch::Receiver<Option<(u16, String)>>,
     ) -> Result<(String, bool)> {
         let restored = tokio::time::timeout(
             RESTORE_WAIT,
@@ -408,71 +390,8 @@ impl Soloist {
         .is_ok_and(|seen| seen.is_ok());
         // Soloist writes its Connect identity next to its stored session.
         let device_id = read_device_id(&config.data_dir).await;
-
-        let mut paired = restored;
         if !restored {
-            log::info!("Soloist has no stored session; pairing it with the playback account");
-            let name = device_name.to_string();
-            let id = device_id.clone();
-            let handed = crate::zeroconf::Credentials::from_playback(credentials)?;
-            let endpoint =
-                tokio::time::timeout(Duration::from_secs(3), zeroconf.wait_for(Option::is_some))
-                    .await
-                    .ok()
-                    .and_then(|seen| seen.ok().and_then(|endpoint| endpoint.clone()));
-            let found = tokio::task::spawn_blocking(move || own_receiver(&name, &id, endpoint))
-                .await
-                .context("pairing stopped")?;
-            let (receiver, info) = match found {
-                Ok(found) => found,
-                Err(error) => {
-                    log::warn!("Soloist could not be paired automatically: {error:#}");
-                    return Ok((device_id, false));
-                }
-            };
-            // Spotify's current receivers take an OAuth access token; older
-            // ones only the reusable login blob librespot keeps. Each gets
-            // its turn, and the first Soloist signs in with wins.
-            let mut attempts: Vec<Handoff> = Vec::new();
-            if let Some(token) = access_token {
-                attempts.push(Handoff::Token {
-                    token,
-                    username: handed.username.clone(),
-                });
-            }
-            attempts.push(Handoff::Blob(handed));
-            let mut last_error = anyhow!("Soloist did not sign in after pairing");
-            for handoff in attempts {
-                let kind = handoff.kind();
-                let receiver = receiver.clone();
-                let info = info.clone();
-                let sent = tokio::task::spawn_blocking(move || handoff.send(&receiver, &info))
-                    .await
-                    .context("pairing stopped")?;
-                if let Err(error) = sent {
-                    log::warn!("Soloist refused the {kind} handoff: {error:#}");
-                    last_error = error;
-                    continue;
-                }
-                if tokio::time::timeout(
-                    PAIR_TIMEOUT,
-                    auth.wait_for(|logged_in| *logged_in == Some(true)),
-                )
-                .await
-                .is_ok_and(|seen| seen.is_ok())
-                {
-                    log::info!("Soloist signed in with the {kind} handoff");
-                    paired = true;
-                    break;
-                }
-                log::warn!("Soloist did not sign in with the {kind} handoff");
-            }
-            if paired {
-                log::info!("Soloist paired");
-                self.send("get_state", json!({}))?;
-            } else {
-                log::warn!("Soloist could not be paired automatically: {last_error:#}");
-            }
+            log::warn!("Soloist has no stored session; waiting for it to be paired");
         }
         if device_id.is_empty() {
             // Playback still works through Soloist's own API; only loads
@@ -480,7 +399,7 @@ impl Soloist {
             // back to the list's start.
             log::warn!("Soloist's Connect device id is unknown");
         }
-        Ok((device_id, paired))
+        Ok((device_id, restored))
     }
 
     /// Soloist's Spotify Connect device id.
@@ -671,79 +590,15 @@ async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) 
 /// The start of the message shown while Soloist waits to be paired.
 const PAIRING_NEEDED: &str = "Soloist is waiting to be paired.";
 
-fn pairing_needed(device_name: &str) -> String {
+/// How to pair Soloist once. Soloist locks its data folder, so Spotifast
+/// has to be closed meanwhile; the key is read from its file, never shown.
+fn pairing_needed(binary: &Path, config: &SoloistConfig, device_name: &str) -> String {
     format!(
-        "{PAIRING_NEEDED} In the Spotify app on your phone, on the same Wi-Fi, open the device picker and choose \"{device_name}\" once."
+        "{PAIRING_NEEDED} Quit Spotifast, run this in Terminal, and choose \"{device_name}\" in the Spotify app on your phone, on the same Wi-Fi: \"{}\" --pair --device-name \"{device_name}\" --data-dir \"{}\" --api-key \"$(cat \"{}\")\"",
+        binary.display(),
+        config.data_dir.display(),
+        config.key_file.display(),
     )
-}
-
-/// The account, as handed to a waiting receiver over ZeroConf.
-enum Handoff {
-    /// An OAuth access token with the streaming scope, and its account.
-    Token { token: String, username: String },
-    /// librespot's reusable login blob, encrypted to the receiver.
-    Blob(crate::zeroconf::Credentials),
-}
-
-impl Handoff {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Token { .. } => "access token",
-            Self::Blob(_) => "login blob",
-        }
-    }
-
-    /// Blocking: one `addUser` request.
-    fn send(
-        &self,
-        receiver: &crate::zeroconf::Receiver,
-        info: &crate::zeroconf::Info,
-    ) -> Result<()> {
-        let http = reqwest::blocking::Client::builder().no_proxy().build()?;
-        match self {
-            Self::Blob(credentials) => {
-                crate::zeroconf::add_user(&http, receiver, info, credentials, "Spotifast")
-            }
-            Self::Token { token, username } => {
-                let version = if info.version.is_empty() {
-                    "2.10.0".to_string()
-                } else {
-                    info.version.clone()
-                };
-                let form = [
-                    ("action", "addUser".to_string()),
-                    ("version", version),
-                    ("tokenType", "accesstoken".to_string()),
-                    ("userName", username.clone()),
-                    ("blob", token.clone()),
-                    ("clientKey", String::new()),
-                    ("deviceName", "Spotifast".to_string()),
-                ];
-                let host = match receiver.address {
-                    std::net::IpAddr::V6(address) => format!("[{address}]"),
-                    std::net::IpAddr::V4(address) => address.to_string(),
-                };
-                let path = receiver.path.trim_start_matches('/');
-                let url = format!("http://{host}:{}/{path}", receiver.port);
-                let reply: Value = http
-                    .post(url)
-                    .timeout(Duration::from_secs(6))
-                    .form(&form)
-                    .send()
-                    .context("Soloist did not accept the connection")?
-                    .json()
-                    .context("Soloist sent an unreadable reply")?;
-                match reply["status"].as_i64() {
-                    Some(101) => Ok(()),
-                    status => bail!(
-                        "{} (status {})",
-                        reply["statusString"].as_str().unwrap_or("refused"),
-                        status.unwrap_or_default()
-                    ),
-                }
-            }
-        }
-    }
 }
 
 /// Reads Soloist's Connect device id, waiting briefly for a first start
@@ -760,76 +615,6 @@ async fn read_device_id(data_dir: &Path) -> String {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     String::new()
-}
-
-/// Finds the Soloist this process started among ZeroConf receivers. Soloist
-/// advertises a hex instance name, so every receiver is asked who it is:
-/// ours has our device id, or failing that our name, and this computer's
-/// addresses are asked first.
-fn own_receiver(
-    name: &str,
-    device_id: &str,
-    endpoint: Option<(u16, String)>,
-) -> Result<(crate::zeroconf::Receiver, crate::zeroconf::Info)> {
-    let http = reqwest::blocking::Client::builder().no_proxy().build()?;
-    // The endpoint Soloist logged: on loopback, with no network browse,
-    // which macOS may not answer for a process on the same computer.
-    if let Some((port, path)) = endpoint {
-        let receiver = crate::zeroconf::Receiver {
-            name: name.to_string(),
-            device_id: None,
-            address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port,
-            path,
-            cast: false,
-        };
-        match crate::zeroconf::get_info(&http, &receiver) {
-            Ok(info) if device_id.is_empty() || info.device_id == device_id => {
-                return Ok((receiver, info));
-            }
-            Ok(_) => log::warn!("Soloist's ZeroConf endpoint answered for another device"),
-            Err(error) => log::warn!("Soloist's ZeroConf endpoint did not answer: {error:#}"),
-        }
-    }
-    let found = crate::zeroconf::discover(BROWSE)?;
-    let mut candidates: Vec<_> = found
-        .into_iter()
-        .filter(|receiver| !receiver.cast)
-        .collect();
-    let local = local_addresses();
-    candidates.sort_by_key(|receiver| !local.contains(&receiver.address));
-    let mut by_name = None;
-    for receiver in candidates {
-        let Ok(info) = crate::zeroconf::get_info(&http, &receiver) else {
-            continue;
-        };
-        if !device_id.is_empty() && info.device_id == device_id {
-            return Ok((receiver, info));
-        }
-        if by_name.is_none() && info.remote_name == name {
-            by_name = Some((receiver, info));
-        }
-    }
-    // Without an id to match, the name is the best evidence there is.
-    by_name
-        .filter(|_| device_id.is_empty())
-        .ok_or_else(|| anyhow!("Soloist did not answer on the local network"))
-}
-
-/// Loopback and the address this computer reaches the network from. Finding
-/// the latter sends nothing: a UDP socket only picks its route on connect.
-fn local_addresses() -> Vec<std::net::IpAddr> {
-    let mut addresses = vec![
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-    ];
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0")
-        && socket.connect("192.0.2.1:9").is_ok()
-        && let Ok(local) = socket.local_addr()
-    {
-        addresses.push(local.ip());
-    }
-    addresses
 }
 
 async fn read_key(path: &Path) -> Result<String> {
@@ -969,21 +754,19 @@ async fn stop_stale(data_dir: &Path) {
     let _ = data_dir;
 }
 
-/// Soloist's output goes to the log, with the API key masked and its
-/// verbose detail left out. The ZeroConf endpoint it names is kept.
-async fn forward_log(
-    output: impl tokio::io::AsyncRead + Unpin,
-    key: String,
-    zeroconf: Arc<watch::Sender<Option<(u16, String)>>>,
-) {
-    let verbose = std::env::var_os("SPOTIFAST_SOLOIST_VERBOSE").is_some();
+/// SPOTIFAST_SOLOIST_VERBOSE=1 runs Soloist verbosely and logs all of it,
+/// for diagnosing.
+fn verbose() -> bool {
+    std::env::var_os("SPOTIFAST_SOLOIST_VERBOSE").is_some()
+}
+
+/// Soloist's output goes to the log, with the API key masked and detail
+/// below warning level left out.
+async fn forward_log(output: impl tokio::io::AsyncRead + Unpin, key: String) {
+    let verbose = verbose();
     let mut lines = tokio::io::BufReader::new(output).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let line = strip_ansi(&line.replace(&key, "[api key]"));
-        if let Some(endpoint) = zeroconf_endpoint(&line) {
-            let _ = zeroconf.send(Some(endpoint));
-        }
-        // SPOTIFAST_SOLOIST_VERBOSE=1 keeps everything, for diagnosing.
         if verbose || !is_verbose_detail(&line) {
             log::info!("soloist: {line}");
         }
@@ -1007,18 +790,6 @@ fn strip_ansi(line: &str) -> String {
         }
     }
     out
-}
-
-/// "Started ZeroConf service on port 61155 path /zc" as its port and path.
-fn zeroconf_endpoint(line: &str) -> Option<(u16, String)> {
-    let rest = line.split("Started ZeroConf service on port ").nth(1)?;
-    let mut words = rest.split_whitespace();
-    let port = words.next()?.parse().ok()?;
-    let path = match (words.next(), words.next()) {
-        (Some("path"), Some(path)) => path.to_string(),
-        _ => "/".to_string(),
-    };
-    Some((port, path))
 }
 
 /// A verbose line, "13:46:04.449 I [...] text", below warning level.
@@ -1432,9 +1203,8 @@ mod tests {
     }
 
     #[test]
-    fn the_zeroconf_endpoint_is_read_from_verbose_output() {
+    fn verbose_detail_is_told_from_warnings() {
         let line = "13:46:04.484 I [f:52                            ] Started ZeroConf service on port 61155 path /zc";
-        assert_eq!(zeroconf_endpoint(line), Some((61155, "/zc".to_string())));
         assert!(is_verbose_detail(line));
         assert!(!is_verbose_detail("13:46:04.484 W [f:52 ] something odd"));
         assert!(!is_verbose_detail("2026-10-23 15:36:14.723: running"));
