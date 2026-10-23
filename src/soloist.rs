@@ -279,7 +279,9 @@ fn install_archive(archive_path: &Path, staging: &Path, programs: &Path) -> Resu
     // and naming the one member keeps anything else in it out.
     let unpacked = staging.join("build");
     std::fs::create_dir_all(&unpacked).context("unable to create a download folder")?;
-    let status = std::process::Command::new("tar")
+    let mut tar = std::process::Command::new("tar");
+    no_console(&mut tar);
+    let status = tar
         .arg("-xf")
         .arg(archive_path)
         .arg("-C")
@@ -345,9 +347,27 @@ pub fn parse_version(text: &str) -> Option<Build> {
     Some(Build { version, built })
 }
 
+/// Windows opens a console window for each console program a windowed app
+/// starts, unless asked not to.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Starts `command` without a console window of its own on Windows.
+fn no_console(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 /// Blocking: runs `binary --version`.
 pub fn read_build(binary: &Path) -> Option<Build> {
-    let output = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    no_console(&mut command);
+    let output = command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .output()
@@ -556,6 +576,9 @@ impl Soloist {
             // on (`Soloist::shutdown`), and a watchdog stops it if this
             // process dies first; a kill on drop would cut that short.
             .kill_on_drop(cfg!(not(unix)));
+        // Its output is read from the pipes above, never shown.
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
         if verbose() {
             command.arg("--verbose");
         }
