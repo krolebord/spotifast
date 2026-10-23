@@ -59,6 +59,16 @@ pub enum TrayIcon {
     Black,
 }
 
+/// What plays audio on this computer. librespot unless the listener chose
+/// Spotify Soloist, which must be installed separately (`crate::soloist`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlaybackEngine {
+    #[default]
+    Librespot,
+    Soloist,
+}
+
 /// Whether a Home shelf is drawn. Hidden shelves still refresh normally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -461,6 +471,17 @@ pub struct Settings {
     /// succeeds. This flag is only in memory and is never persisted.
     #[serde(skip)]
     pub proxy_password_legacy: bool,
+    /// What plays audio on this computer.
+    #[serde(default, skip_serializing_if = "playback_engine_is_default")]
+    pub playback_engine: PlaybackEngine,
+    /// Where Spotify Soloist is installed, when not on `PATH` or in the
+    /// usual folders. Its API key is kept apart, in an owner-only file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soloist_path: Option<String>,
+}
+
+fn playback_engine_is_default(engine: &PlaybackEngine) -> bool {
+    *engine == PlaybackEngine::Librespot
 }
 
 impl std::fmt::Debug for Settings {
@@ -522,6 +543,8 @@ impl Default for Settings {
             playback_authorized: false,
             keep_playing_in_background: true,
             tray_icon: TrayIcon::Colour,
+            playback_engine: PlaybackEngine::Librespot,
+            soloist_path: None,
             mac_notch_widget: false,
             mac_show_in_dock: true,
             check_for_updates: true,

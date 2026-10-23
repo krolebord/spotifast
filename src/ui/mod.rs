@@ -409,7 +409,7 @@ fn audio_key_banner(app: &mut App, ui: &mut egui::Ui) {
         ),
         &gettext(
             locale,
-            "Spotify refused the key that unlocks the audio. Spotifast can't fix that, but it sometimes clears up on its own. You can still play on your phone or another Spotify device.",
+            "Spotify refused the key that unlocks the audio. Spotifast can't fix that, but it sometimes clears up on its own. You can still play on your phone or another Spotify device, or choose Spotify Soloist as the playback engine in Settings.",
         ),
         [
             (

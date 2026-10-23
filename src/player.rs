@@ -64,6 +64,9 @@ pub struct EngineConfig {
     pub proxy: crate::settings::ProxyConfig,
     /// The folder a playlist's `spotify:local:` songs play from.
     pub local_files: Option<PathBuf>,
+    /// Play through Spotify Soloist instead of librespot's player. The
+    /// librespot session still connects, for the reads it serves.
+    pub soloist: Option<crate::soloist::SoloistConfig>,
 }
 
 impl EngineConfig {
@@ -379,11 +382,22 @@ impl KeptPlayer {
     }
 }
 
+/// What plays the audio.
+enum Output {
+    /// librespot's player, steered by its Spirc.
+    Librespot {
+        player: Arc<Player>,
+        spirc: Arc<Spirc>,
+        mixer: Arc<dyn Mixer>,
+        audio: Arc<AudioControl>,
+    },
+    /// A Spotify Soloist process (`crate::soloist`).
+    Soloist(Arc<crate::soloist::Soloist>),
+}
+
 pub struct Engine {
-    player: Arc<Player>,
-    spirc: Arc<Spirc>,
+    output: Output,
     session: Session,
-    mixer: Arc<dyn Mixer>,
     device_id: String,
     state: Arc<Mutex<LocalState>>,
     /// What was playing when the session ended on its own.
@@ -391,7 +405,6 @@ pub struct Engine {
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// The session is being ended while its player plays on.
     closing: Arc<std::sync::atomic::AtomicBool>,
-    audio: Arc<AudioControl>,
     /// The player came from a dropped session and still plays what that
     /// session left it, until something is loaded through this one.
     carrying: std::sync::atomic::AtomicBool,
@@ -412,6 +425,12 @@ impl Engine {
         notify: Notify,
         kept: Option<KeptPlayer>,
     ) -> Result<Self> {
+        if let Some(soloist) = &config.soloist {
+            if let Some(kept) = kept {
+                kept.stop();
+            }
+            return Self::connect_soloist(config, soloist, proxy, credentials, cache, notify).await;
+        }
         let session_config = SessionConfig {
             device_id: config.device_id(),
             autoplay: Some(config.autoplay),
@@ -483,17 +502,121 @@ impl Engine {
 
         let device_id = config.device_id();
         Ok(Self {
-            player,
-            spirc: Arc::new(spirc),
+            output: Output::Librespot {
+                player,
+                spirc: Arc::new(spirc),
+                mixer,
+                audio,
+            },
             session,
-            mixer,
             device_id,
             state,
             interrupted,
             shutting_down,
             closing,
-            audio,
             carrying: std::sync::atomic::AtomicBool::new(carrying),
+        })
+    }
+
+    /// Connects the librespot session for reads only, with no player and
+    /// no Connect device of its own, and plays through Spotify Soloist.
+    async fn connect_soloist(
+        config: &EngineConfig,
+        soloist: &crate::soloist::SoloistConfig,
+        proxy: Option<reqwest::Url>,
+        credentials: Credentials,
+        cache: Cache,
+        notify: Notify,
+    ) -> Result<Self> {
+        let session_config = SessionConfig {
+            device_id: config.device_id(),
+            autoplay: Some(config.autoplay),
+            proxy,
+            ..SessionConfig::default()
+        };
+        let session = Session::new(session_config, Some(cache));
+        let _ = session.spclient().client_token().await;
+        session
+            .connect(credentials.clone(), true)
+            .await
+            .context("unable to connect to Spotify")?;
+        let _ = session.login5().auth_token().await;
+
+        let state = Arc::new(Mutex::new(LocalState {
+            volume: config.initial_volume,
+            connected: true,
+            username: session.username(),
+            ..LocalState::default()
+        }));
+        let player = match crate::soloist::Soloist::start(
+            soloist,
+            &config.device_name,
+            config.initial_volume,
+            &credentials,
+            Arc::clone(&state),
+            Arc::clone(&notify),
+        )
+        .await
+        {
+            Ok(player) => Arc::new(player),
+            Err(error) => {
+                session.shutdown();
+                return Err(error);
+            }
+        };
+        notify(EngineEvent::State(
+            state.lock().unwrap_or_else(|p| p.into_inner()).clone(),
+        ));
+
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
+        {
+            let shutting_down = Arc::clone(&shutting_down);
+            let closing = Arc::clone(&closing);
+            let state = Arc::clone(&state);
+            let interrupted = Arc::clone(&interrupted);
+            let session = session.clone();
+            let player = Arc::clone(&player);
+            tokio::spawn(async move {
+                // Either half ending ends the engine: the backend then
+                // reconnects both, which restarts Soloist too.
+                let session_gone = async {
+                    while !session.is_invalid() {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                };
+                tokio::select! {
+                    () = player.ended() => {}
+                    () = session_gone => {}
+                }
+                player.shutdown();
+                session.shutdown();
+                let shut_down = shutting_down.load(std::sync::atomic::Ordering::SeqCst);
+                {
+                    let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
+                    *interrupted.lock().unwrap_or_else(|p| p.into_inner()) = current.interrupted();
+                    // Soloist's audio stopped with it.
+                    session_ended(&mut current, true);
+                    notify(EngineEvent::State(current.clone()));
+                }
+                if !shut_down && !closing.load(std::sync::atomic::Ordering::SeqCst) {
+                    notify(EngineEvent::SessionEnded);
+                }
+            });
+        }
+
+        let device_id = player.device_id().to_string();
+        log::info!("playing through Spotify Soloist");
+        Ok(Self {
+            output: Output::Soloist(player),
+            session,
+            device_id,
+            state,
+            interrupted,
+            shutting_down,
+            closing,
+            carrying: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -565,12 +688,21 @@ impl Engine {
     /// The player and what it plays through, for the engine that replaces
     /// this one after its session dropped. Nothing stops it: the song plays
     /// on until the next engine takes it over or [`KeptPlayer::stop`].
-    pub fn keep_player(&self) -> KeptPlayer {
-        KeptPlayer {
-            player: Arc::clone(&self.player),
-            mixer: Arc::clone(&self.mixer),
-            state: Arc::clone(&self.state),
-            audio: Arc::clone(&self.audio),
+    /// `None` with Soloist, whose audio ends with its process.
+    pub fn keep_player(&self) -> Option<KeptPlayer> {
+        match &self.output {
+            Output::Librespot {
+                player,
+                mixer,
+                audio,
+                ..
+            } => Some(KeptPlayer {
+                player: Arc::clone(player),
+                mixer: Arc::clone(mixer),
+                state: Arc::clone(&self.state),
+                audio: Arc::clone(audio),
+            }),
+            Output::Soloist(_) => None,
         }
     }
 
@@ -616,10 +748,15 @@ impl Engine {
     /// engine is heard at it from now on. Connect is told on release, not
     /// while the slider is still moving.
     fn note_volume(&self, volume: u16, preview: bool) -> Result<()> {
-        self.mixer.set_volume(volume);
         self.state.lock().unwrap_or_else(|p| p.into_inner()).volume = volume;
-        if !preview {
-            self.spirc.set_volume(volume)?;
+        match &self.output {
+            Output::Librespot { spirc, mixer, .. } => {
+                mixer.set_volume(volume);
+                if !preview {
+                    spirc.set_volume(volume)?;
+                }
+            }
+            Output::Soloist(soloist) => soloist.set_volume(volume, preview)?,
         }
         Ok(())
     }
@@ -673,8 +810,16 @@ impl Engine {
     pub fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.spirc.shutdown();
-        self.player.stop();
+        match &self.output {
+            Output::Librespot { player, spirc, .. } => {
+                let _ = spirc.shutdown();
+                player.stop();
+            }
+            Output::Soloist(soloist) => {
+                soloist.shutdown();
+                self.session.shutdown();
+            }
+        }
     }
 
     /// Ends the session but leaves the player playing, for an engine that
@@ -682,11 +827,21 @@ impl Engine {
     pub fn close_session(&self) {
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let _ = self.spirc.shutdown();
+        match &self.output {
+            Output::Librespot { spirc, .. } => {
+                let _ = spirc.shutdown();
+            }
+            Output::Soloist(soloist) => {
+                soloist.shutdown();
+                self.session.shutdown();
+            }
+        }
     }
 
     pub fn resume_point(&self) -> Option<PlaybackResume> {
-        if let Some(snapshot) = self.spirc.disconnected_playback() {
+        if let Output::Librespot { spirc, .. } = &self.output
+            && let Some(snapshot) = spirc.disconnected_playback()
+        {
             return Some(PlaybackResume::Session(snapshot));
         }
         self.interrupted().map(|interrupted| {
@@ -703,13 +858,18 @@ impl Engine {
         // A carried song is picked up where it has got to, playing or
         // paused as it is now, not where the session dropped: the player
         // already has it, so the restore only lines its decoder up.
-        let now = self.carrying().then(|| self.keep_player().now()).flatten();
+        let now = self
+            .carrying()
+            .then(|| self.keep_player().and_then(|kept| kept.now()))
+            .flatten();
         self.stop_carrying();
-        match resume_from(resume, now.as_ref()) {
-            PlaybackResume::Session(snapshot) => {
-                self.spirc.restore_playback(snapshot).map_err(Into::into)
+        match (resume_from(resume, now.as_ref()), &self.output) {
+            (PlaybackResume::Session(snapshot), Output::Librespot { spirc, .. }) => {
+                spirc.restore_playback(snapshot).map_err(Into::into)
             }
-            PlaybackResume::Track(spec) => self.send_command(PlayerCommand::Load(spec)),
+            // A librespot snapshot means nothing to Soloist.
+            (PlaybackResume::Session(_), Output::Soloist(_)) => Ok(()),
+            (PlaybackResume::Track(spec), _) => self.send_command(PlayerCommand::Load(spec)),
         }
     }
 
@@ -722,18 +882,28 @@ impl Engine {
             &self.state.lock().unwrap_or_else(|p| p.into_inner()),
             &command,
         );
-        if interrupts_audio {
-            self.audio.interrupt();
+        let audio = match &self.output {
+            Output::Librespot { audio, .. } => Some(audio),
+            Output::Soloist(_) => None,
+        };
+        if interrupts_audio && let Some(audio) = audio {
+            audio.interrupt();
         }
         let result = self.send_command(command);
-        if interrupts_audio && result.is_err() {
-            self.audio.stopped();
+        if interrupts_audio
+            && result.is_err()
+            && let Some(audio) = audio
+        {
+            audio.stopped();
         }
         result
     }
 
     fn send_command(&self, command: PlayerCommand) -> Result<()> {
-        let spirc = &self.spirc;
+        let spirc = match &self.output {
+            Output::Librespot { spirc, .. } => spirc,
+            Output::Soloist(soloist) => return self.send_soloist(soloist, command),
+        };
         match command {
             PlayerCommand::Toggle => spirc.play_pause()?,
             PlayerCommand::Next => spirc.next()?,
@@ -784,6 +954,70 @@ impl Engine {
                 };
                 spirc.activate()?;
                 spirc.load(request)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// A command for Soloist, through its API or, for loads, Connect.
+    fn send_soloist(
+        &self,
+        soloist: &Arc<crate::soloist::Soloist>,
+        command: PlayerCommand,
+    ) -> Result<()> {
+        use serde_json::json;
+        match command {
+            PlayerCommand::Toggle => {
+                let playing = {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let playing = state.playback == Playback::Playing;
+                    // Shown at once; Soloist's event confirms it.
+                    if playing {
+                        state.position_ms = state.position_now();
+                        state.position_at = None;
+                        state.playback = Playback::Paused;
+                    }
+                    playing
+                };
+                soloist.send(if playing { "pause" } else { "play" }, json!({}))?;
+            }
+            PlayerCommand::Next => soloist.send("skip_next", json!({}))?,
+            PlayerCommand::Previous => soloist.send("skip_prev", json!({}))?,
+            PlayerCommand::ClearQueue => {
+                anyhow::bail!("Spotify Soloist cannot clear the queue")
+            }
+            PlayerCommand::AddToQueue(uri) => {
+                if crate::util::uri_kind(&uri) != Some("track") {
+                    anyhow::bail!("Spotify Soloist can only queue songs");
+                }
+                soloist.send("add_to_queue", json!({ "uri": uri }))?;
+            }
+            PlayerCommand::Seek(position_ms) => {
+                soloist.send("seek", json!({ "position_ms": position_ms }))?;
+            }
+            PlayerCommand::Volume(volume) => self.note_volume(volume, false)?,
+            PlayerCommand::VolumePreview(volume) => self.note_volume(volume, true)?,
+            PlayerCommand::Shuffle(enabled) => {
+                soloist.send("set_shuffle", json!({ "enabled": enabled }))?;
+            }
+            PlayerCommand::Repeat(mode) => soloist.set_repeat(mode)?,
+            PlayerCommand::Transfer => soloist.send("activate", json!({}))?,
+            PlayerCommand::Load(spec) => {
+                if spec.context_uri.is_none() && spec.uris.is_empty() {
+                    anyhow::bail!("nothing to play");
+                }
+                {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.loading = true;
+                    if state.playback == Playback::Stopped {
+                        state.playback = Playback::Loading;
+                    }
+                }
+                let runtime =
+                    tokio::runtime::Handle::try_current().context("no runtime to load on")?;
+                runtime.spawn(Arc::clone(soloist).load(self.session.clone(), spec));
             }
         }
         Ok(())
@@ -1852,6 +2086,7 @@ mod tests {
             audio_cache_limit: None,
             proxy: crate::settings::ProxyConfig::Off,
             local_files: None,
+            soloist: None,
         };
         let id = config.device_id();
         assert_eq!(id.len(), 40);
