@@ -93,6 +93,9 @@ pub fn find_binary(configured: Option<&str>) -> Option<PathBuf> {
 /// A running Soloist and the connection to its local API.
 pub struct Soloist {
     commands: mpsc::UnboundedSender<Value>,
+    /// The process, for a stop that cannot wait on the runtime.
+    pid: Option<u32>,
+    stopping: std::sync::atomic::AtomicBool,
     device_id: String,
     stop: watch::Sender<bool>,
     ended: watch::Receiver<bool>,
@@ -129,6 +132,9 @@ impl Soloist {
         // Left behind by a Soloist that did not shut down cleanly.
         let _ = tokio::fs::remove_file(&addr_file).await;
         let _ = tokio::fs::remove_file(&port_file).await;
+        // A Soloist a previous run left behind, after a crash or a kill,
+        // holds the data directory's lock and its Connect device.
+        stop_stale(&config.data_dir).await;
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -148,7 +154,10 @@ impl Soloist {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
+            // On Unix it is stopped with a signal it can shut down cleanly
+            // on (`Soloist::shutdown`), and a watchdog stops it if this
+            // process dies first; a kill on drop would cut that short.
+            .kill_on_drop(cfg!(not(unix)));
         if let Some(cache) = &config.cache_dir {
             command.arg("--cache-dir").arg(cache);
             if let Some(mb) = config.cache_mb {
@@ -157,6 +166,11 @@ impl Soloist {
         }
         log::info!("starting Soloist from {}", binary.display());
         let mut child = command.spawn().context("unable to start Spotify Soloist")?;
+        let pid = child.id();
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            watch_parent(pid);
+        }
         let (zeroconf_tx, zeroconf) = watch::channel(None::<(u16, String)>);
         let zeroconf_tx = Arc::new(zeroconf_tx);
         if let Some(out) = child.stdout.take() {
@@ -279,6 +293,8 @@ impl Soloist {
 
         let mut soloist = Self {
             commands,
+            pid,
+            stopping: std::sync::atomic::AtomicBool::new(false),
             device_id: String::new(),
             stop,
             ended,
@@ -422,7 +438,18 @@ impl Soloist {
     }
 
     /// Stops the Soloist process.
+    /// Signals at once rather than through a task: the app may be
+    /// quitting, and its runtime would drop that task before it ran.
     pub fn shutdown(&self) {
+        if !self
+            .stopping
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            #[cfg(unix)]
+            if let Some(pid) = self.pid {
+                signal(pid, libc::SIGTERM);
+            }
+        }
         let _ = self.stop.send(true);
     }
 
@@ -769,11 +796,7 @@ async fn wait_for_port(child: &mut tokio::process::Child, port_file: &Path) -> R
 async fn terminate(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-            .await;
+        signal(pid, libc::SIGTERM);
         if tokio::time::timeout(Duration::from_secs(3), child.wait())
             .await
             .is_ok()
@@ -784,7 +807,84 @@ async fn terminate(child: &mut tokio::process::Child) {
     let _ = child.kill().await;
 }
 
-/// Soloist's output goes to the log, with the API key masked.
+#[cfg(unix)]
+fn signal(pid: u32, signal: libc::c_int) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) takes plain integers and touches no memory of ours.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// Stops Soloist if this process ends without doing so itself: crashed,
+/// killed, or quit by a signal that skips shutdown. A shell polls both
+/// processes every two seconds and leaves with Soloist.
+#[cfg(unix)]
+fn watch_parent(soloist: u32) {
+    let parent = std::process::id();
+    let script = format!(
+        "while kill -0 {parent} 2>/dev/null && kill -0 {soloist} 2>/dev/null; do sleep 2; done; \
+         kill -0 {parent} 2>/dev/null || kill -TERM {soloist} 2>/dev/null"
+    );
+    match std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // Reaped on a thread of its own, so it leaves no zombie behind.
+        Ok(mut watchdog) => {
+            let _ = std::thread::Builder::new()
+                .name("soloist-watchdog".into())
+                .spawn(move || watchdog.wait());
+        }
+        Err(error) => log::warn!("no watchdog for Soloist: {error}"),
+    }
+}
+
+/// Stops a Soloist still running on `data_dir` from an earlier run. It is
+/// recognised by the pid file Soloist keeps there and its command line,
+/// so an unrelated process that reused the pid is left alone.
+async fn stop_stale(data_dir: &Path) {
+    #[cfg(unix)]
+    {
+        let Ok(text) = tokio::fs::read_to_string(data_dir.join("soloist.pid")).await else {
+            return;
+        };
+        let Ok(pid) = text.trim().parse::<u32>() else {
+            return;
+        };
+        if pid == 0 || !signal(pid, 0) {
+            return;
+        }
+        let Ok(output) = tokio::process::Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .await
+        else {
+            return;
+        };
+        let command = String::from_utf8_lossy(&output.stdout);
+        if !command.contains(BINARY) || !command.contains(&*data_dir.to_string_lossy()) {
+            return;
+        }
+        log::warn!("stopping a Soloist left running by an earlier run (pid {pid})");
+        signal(pid, libc::SIGTERM);
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !signal(pid, 0) {
+                return;
+            }
+        }
+        signal(pid, libc::SIGKILL);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    #[cfg(not(unix))]
+    let _ = data_dir;
+}
+
 /// Soloist's output goes to the log, with the API key masked and its
 /// verbose detail left out. The ZeroConf endpoint it names is kept.
 async fn forward_log(
