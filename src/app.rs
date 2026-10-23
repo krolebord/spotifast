@@ -693,6 +693,8 @@ pub struct App {
     pub soloist_downloading: bool,
     /// How the last Soloist download ended, for Settings to say.
     pub soloist_downloaded: Option<Result<crate::soloist::Downloaded, String>>,
+    /// When Soloist last asked the backend whether its daily check is due.
+    soloist_checked: Option<Instant>,
     /// The listener closed the audio-key banner, and no song has played
     /// here since: further refusals only toast.
     audio_key_banner_closed: bool,
@@ -1274,6 +1276,7 @@ impl App {
             soloist_inspected: false,
             soloist_downloading: false,
             soloist_downloaded: None,
+            soloist_checked: None,
             audio_key_banner_closed: false,
             shared_rate_limits_seen: 0,
             shared_rate_limited_at: None,
@@ -2483,7 +2486,9 @@ impl App {
             match event {
                 Event::SoloistSignedIn => self.soloist_inspected = false,
                 Event::SoloistInstall(install) => self.soloist_install = Some(install),
-                Event::SoloistDownloaded(result) => self.soloist_downloaded(result),
+                Event::SoloistDownloaded { asked, result } => {
+                    self.soloist_downloaded(asked, result)
+                }
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -12453,14 +12458,38 @@ impl App {
         if !self.soloist_downloading {
             self.soloist_downloading = true;
             self.soloist_downloaded = None;
-            self.backend.send(Command::DownloadSoloist);
+            self.backend.send(Command::DownloadSoloist { asked: true });
+        }
+    }
+
+    /// While Soloist plays, the backend looks for a newer build once a day;
+    /// it keeps the day across launches, so this only asks it hourly.
+    fn check_soloist(&mut self) {
+        const ASK_EVERY: Duration = Duration::from_secs(60 * 60);
+        if self.settings.soloist == crate::settings::SoloistUse::Always
+            && self
+                .soloist_checked
+                .is_none_or(|checked| checked.elapsed() >= ASK_EVERY)
+        {
+            self.soloist_checked = Some(Instant::now());
+            self.backend.send(Command::DownloadSoloist { asked: false });
         }
     }
 
     /// A new build plays from Soloist's next start. One that could not
-    /// start, missing or expired, is started again now.
-    fn soloist_downloaded(&mut self, result: Result<crate::soloist::Downloaded, String>) {
-        self.soloist_downloading = false;
+    /// start, missing or expired, is started again now. A check of its own
+    /// speaks only when it brought a new build.
+    fn soloist_downloaded(
+        &mut self,
+        asked: bool,
+        result: Result<crate::soloist::Downloaded, String>,
+    ) {
+        if !asked && !result.as_ref().is_ok_and(|downloaded| downloaded.new) {
+            return;
+        }
+        if asked {
+            self.soloist_downloading = false;
+        }
         self.soloist_inspected = false;
         if result.as_ref().is_ok_and(|downloaded| downloaded.new)
             && self.settings.soloist == crate::settings::SoloistUse::Always
@@ -12739,6 +12768,7 @@ impl App {
         if self.page() == &Page::Settings || self.audio_key_banner {
             self.inspect_soloist();
         }
+        self.check_soloist();
         // MilkDrop runs in a child process and can outlive the main window.
         // Poll it before applying actions because its keys produce actions.
         #[cfg(feature = "milkdrop")]

@@ -157,6 +157,12 @@ const ARCHIVE_HOSTS: [&str; 2] = ["spotifycdn.com", "spotify.com"];
 /// is not a Soloist build and must not fill the disk.
 const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+/// Beside each build: the `ETag` Spotify's server sent with its archive.
+const ETAG_FILE: &str = "etag";
+/// In the programs folder: touched whenever Spotify's server was asked.
+const CHECKED_FILE: &str = ".checked";
+/// How often Soloist looks for a newer build on its own while in use.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Spotify's archive for this computer, or `None` where it publishes none
 /// (Intel Macs, among others).
@@ -215,15 +221,27 @@ pub struct Downloaded {
 /// `programs`, checks that it runs and has not expired, and removes the
 /// builds it replaces. A failure leaves the installed build as it was.
 pub fn download(client: &reqwest::blocking::Client, programs: &Path) -> Result<Downloaded> {
+    // A check of its own and one the listener asked for share the folder.
+    static DOWNLOADING: Mutex<()> = Mutex::new(());
+    let _one = DOWNLOADING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let archive = ARCHIVE.context("Spotify publishes no Soloist build for this computer")?;
     std::fs::create_dir_all(programs).context("unable to create Soloist's program folder")?;
+    // The installed build and the fingerprint Spotify's server gave it, so
+    // an unchanged archive is not downloaded again.
+    let known = installed(programs).and_then(|(_, binary)| {
+        let etag = std::fs::read_to_string(binary.parent()?.join(ETAG_FILE)).ok()?;
+        Some((etag.trim().to_string(), read_build(&binary)?))
+    });
     // Not a build time, so `installed` never picks it.
     let staging = programs.join(format!(".download-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("unable to create a download folder")?;
-    let result = download_into(client, archive, &staging, programs);
+    let result = download_into(client, archive, &staging, programs, known);
     let _ = std::fs::remove_dir_all(&staging);
     let downloaded = result?;
+    let _ = std::fs::write(programs.join(CHECKED_FILE), b"");
     // Older builds; one still running on Windows stays until next time.
     if let Ok(entries) = std::fs::read_dir(programs) {
         for entry in entries.filter_map(Result::ok) {
@@ -245,13 +263,36 @@ fn download_into(
     archive: &str,
     staging: &Path,
     programs: &Path,
+    known: Option<(String, Build)>,
 ) -> Result<Downloaded> {
     use std::io::Read;
+    let url = format!("{ARCHIVES_URL}{archive}");
+    // Spotify's server ignores If-None-Match, so the fingerprint is
+    // compared here, from the headers alone.
+    if let Some((etag, build)) = known {
+        let current = client
+            .head(&url)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| anyhow!("unable to reach Spotify: {}", error.without_url()))?
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|etag| etag.to_str().ok())
+            .map(str::to_string);
+        if current.as_deref() == Some(etag.as_str()) {
+            return Ok(Downloaded { build, new: false });
+        }
+    }
     let response = client
-        .get(format!("{ARCHIVES_URL}{archive}"))
+        .get(&url)
         .send()
         .and_then(reqwest::blocking::Response::error_for_status)
         .map_err(|error| anyhow!("unable to download Soloist: {}", error.without_url()))?;
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|etag| etag.to_str().ok())
+        .map(str::to_string);
     if response
         .content_length()
         .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
@@ -269,7 +310,26 @@ fn download_into(
     file.sync_all()
         .context("unable to save the Soloist download")?;
     drop(file);
-    install_archive(&archive_path, staging, programs)
+    let downloaded = install_archive(&archive_path, staging, programs)?;
+    if let Some(etag) = etag {
+        let folder = programs.join(downloaded.build.built.as_second().to_string());
+        let _ = std::fs::write(folder.join(ETAG_FILE), etag);
+    }
+    Ok(downloaded)
+}
+
+/// Whether Soloist should look for a newer build on its own: a downloaded
+/// one is in use and was last checked a day or more ago. Only reads file
+/// metadata.
+pub fn check_due(programs: &Path) -> bool {
+    if ARCHIVE.is_none() || binary_override().is_some() || installed(programs).is_none() {
+        return false;
+    }
+    std::fs::metadata(programs.join(CHECKED_FILE))
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|checked| checked.elapsed().ok())
+        .is_none_or(|since| since >= CHECK_INTERVAL)
 }
 
 /// Unpacks the program from Spotify's archive and installs it under its
@@ -1572,6 +1632,15 @@ mod tests {
             Some((1_792_778_483, dir.join("1792778483").join(BINARY)))
         );
         assert_eq!(installed(&dir.join("missing")), None);
+        if ARCHIVE.is_some() && binary_override().is_none() {
+            assert!(check_due(&dir), "never checked");
+            std::fs::write(dir.join(CHECKED_FILE), b"").unwrap();
+            assert!(!check_due(&dir), "checked a moment ago");
+        }
+        assert!(
+            !check_due(&dir.join("missing")),
+            "nothing downloaded to update"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1661,7 +1730,11 @@ mod tests {
             read_build(&find_binary_in(&dir).unwrap()),
             Some(downloaded.build)
         );
+        // Asked again, the saved fingerprint spares the download.
+        let program = find_binary_in(&dir).unwrap();
+        assert!(program.parent().unwrap().join(ETAG_FILE).is_file());
         assert!(!download(&client, &dir).unwrap().new);
+        assert!(!check_due(&dir), "just checked");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
