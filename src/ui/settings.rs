@@ -642,6 +642,20 @@ fn soloist_section(
                                 .desired_width(160.0),
                         )
                     });
+                // Where the key is made, beside the field it goes in.
+                if theme::icon_button(
+                    ui,
+                    Icon::ExternalLink,
+                    15.0,
+                    palette.secondary,
+                    palette.text,
+                    &gettext(locale, "Open the Spotify for Developers dashboard"),
+                )
+                .clicked()
+                {
+                    app.actions
+                        .push(Action::OpenUrl(crate::soloist::DASHBOARD_URL.into()));
+                }
                 if clicked && !key.trim().is_empty() {
                     let path = app.dirs.soloist_key_file();
                     app.files.write_or(

@@ -149,6 +149,8 @@ fn installed(programs: &Path) -> Option<(i64, PathBuf)> {
 /// Where Spotify publishes new Soloist builds, with their terms and licenses.
 pub const DOWNLOADS_URL: &str =
     "https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates";
+/// Where the user makes the API key Soloist starts with.
+pub const DASHBOARD_URL: &str = "https://developer.spotify.com/dashboard";
 /// Spotify's server for the archives `DOWNLOADS_URL` links to.
 const ARCHIVES_URL: &str = "https://soloist-builds.spotifycdn.com/";
 /// A download may be redirected only within Spotify's own servers.
