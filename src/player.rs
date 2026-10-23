@@ -313,6 +313,8 @@ pub enum PlayerCommand {
 pub enum EngineEvent {
     State(LocalState),
     SessionEnded,
+    /// Soloist, started without a session, was paired from Spotify's app.
+    SoloistSignedIn,
     /// The output opened on the device an older build saved by `name`;
     /// the setting holds its `id` from now on.
     AudioDevice {

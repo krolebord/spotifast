@@ -409,9 +409,17 @@ fn audio_key_banner(app: &mut App, ui: &mut egui::Ui) {
         ),
         &gettext(
             locale,
-            "Spotify refused the key that unlocks the audio. Spotifast can't fix that, but it sometimes clears up on its own. You can still play on your phone or another Spotify device, or choose Spotify Soloist as the playback engine in Settings.",
+            "Spotify refused the key that unlocks the audio. Spotifast can't fix that, but it sometimes clears up on its own. Spotify Soloist, Spotify's own player, can play it here instead, or you can play on your phone or another Spotify device.",
         ),
         [
+            if app.soloist_ready() {
+                (
+                    gettext(locale, "Play through Soloist"),
+                    Action::PlayThroughSoloist,
+                )
+            } else {
+                (gettext(locale, "Set up Soloist"), Action::SetUpSoloist)
+            },
             (
                 gettext(locale, "Play on another device"),
                 Action::PlayOnAnotherDevice,
@@ -425,15 +433,14 @@ fn audio_key_banner(app: &mut App, ui: &mut egui::Ui) {
     );
 }
 
-/// A notice under the top bar: a bold line, a sentence or two, a main and
-/// a secondary button, and a close button.
+/// A notice under the top bar: a bold line, a sentence or two, a main
+/// button and the others beside it, and a close button.
 fn banner(
     app: &mut App,
     ui: &mut egui::Ui,
     title: &str,
     text: &str,
-    [(primary, primary_action), (secondary, secondary_action)]: [(std::borrow::Cow<'static, str>, Action);
-        2],
+    buttons: impl IntoIterator<Item = (std::borrow::Cow<'static, str>, Action)>,
     close: Action,
 ) {
     use crate::i18n::gettext;
@@ -490,11 +497,10 @@ fn banner(
                     );
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
-                        if theme::pill_button(ui, &palette, &primary, true).clicked() {
-                            app.actions.push(primary_action);
-                        }
-                        if theme::pill_button(ui, &palette, &secondary, false).clicked() {
-                            app.actions.push(secondary_action);
+                        for (index, (label, action)) in buttons.into_iter().enumerate() {
+                            if theme::pill_button(ui, &palette, &label, index == 0).clicked() {
+                                app.actions.push(action);
+                            }
                         }
                     });
                 });

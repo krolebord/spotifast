@@ -702,6 +702,11 @@ pub fn autostart() -> fastframe_autostart::Autostart {
 
 pub enum Command {
     OpenThemesFolder,
+    /// Find Spotify Soloist and read its build and accounts, off the UI
+    /// thread: it runs `soloist --version`.
+    InspectSoloist,
+    /// Download Spotify's newest Soloist build from Spotify's servers.
+    DownloadSoloist,
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
     /// ask the person first.
@@ -965,6 +970,12 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    /// What `Command::InspectSoloist` found.
+    SoloistInstall(crate::soloist::Install),
+    /// How `Command::DownloadSoloist` ended.
+    SoloistDownloaded(Result<crate::soloist::Downloaded, String>),
+    /// Soloist was paired from Spotify's app: its accounts changed.
+    SoloistSignedIn,
     /// The folder picked in the local files dialog; `None` when cancelled.
     LocalFilesFolderChosen(Option<std::path::PathBuf>),
     /// The songs in `folder`, by the `spotify:local:` URIs they play for.
@@ -2187,6 +2198,34 @@ impl Worker {
                             }
                         };
                         let _ = events.send(Event::Autostart { request, result });
+                        waker.wake();
+                    });
+                }
+                Command::InspectSoloist => {
+                    let programs = self.dirs.soloist_programs_dir();
+                    let data_dir = self.dirs.soloist_data_dir();
+                    let key_file = self.dirs.soloist_key_file();
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let install = crate::soloist::inspect(&programs, &data_dir, &key_file);
+                        let _ = events.send(Event::SoloistInstall(install));
+                        waker.wake();
+                    });
+                }
+                Command::DownloadSoloist => {
+                    let programs = self.dirs.soloist_programs_dir();
+                    let proxy = self.engine_config.proxy.clone();
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::soloist::download_client(&proxy)
+                            .and_then(|client| crate::soloist::download(&client, &programs))
+                            .map_err(|error| format!("{error:#}"));
+                        if let Err(error) = &result {
+                            log::warn!("Soloist download failed: {error}");
+                        }
+                        let _ = events.send(Event::SoloistDownloaded(result));
                         waker.wake();
                     });
                 }
@@ -3464,6 +3503,10 @@ impl Worker {
                 }
                 EngineEvent::SessionEnded => {
                     let _ = commands.send(Command::Reconnect);
+                }
+                EngineEvent::SoloistSignedIn => {
+                    let _ = events.send(Event::SoloistSignedIn);
+                    waker.wake();
                 }
                 EngineEvent::AudioDevice { name, id } => {
                     let _ = events.send(Event::AudioDeviceFound { name, id });

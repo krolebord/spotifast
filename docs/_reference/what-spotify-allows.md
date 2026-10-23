@@ -223,8 +223,8 @@ The Web API and librespot do not provide these features:
   will reconsider this if librespot gains lawful support, but it will not
   bypass Spotify's DRM.
 - **Soloist as the player.** Spotify's Soloist plays lossless and works with
-  Spotify Connect, but Spotify ships it only for Linux and does not allow apps
-  to bundle it. Each listener would need their own developer key and pairing,
+  Spotify Connect. Spotify publishes it for Linux, Apple silicon Macs and
+  Windows, but does not allow apps to bundle or redistribute it. Each listener would need their own developer key and pairing,
   builds stop working after 90 days, and it has no API for the library,
   playlists or search, and no way to feed the equalizer and visualisers.
   Spotifast will reconsider it if Spotify offers a supported desktop path.

@@ -59,14 +59,18 @@ pub enum TrayIcon {
     Black,
 }
 
-/// What plays audio on this computer. librespot unless the listener chose
-/// Spotify Soloist, which must be installed separately (`crate::soloist`).
+/// When Spotify Soloist, downloaded from Spotify (`crate::soloist`), plays the
+/// audio instead of librespot's player. librespot's session, Connect device
+/// and queue stay in use either way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum PlaybackEngine {
+pub enum SoloistUse {
+    Always,
+    /// Also any value this build does not know, so one setting cannot make
+    /// the whole file unreadable.
     #[default]
-    Librespot,
-    Soloist,
+    #[serde(other)]
+    Off,
 }
 
 /// Whether a Home shelf is drawn. Hidden shelves still refresh normally.
@@ -471,17 +475,13 @@ pub struct Settings {
     /// succeeds. This flag is only in memory and is never persisted.
     #[serde(skip)]
     pub proxy_password_legacy: bool,
-    /// What plays audio on this computer.
-    #[serde(default, skip_serializing_if = "playback_engine_is_default")]
-    pub playback_engine: PlaybackEngine,
-    /// Where Spotify Soloist is installed, when not on `PATH` or in the
-    /// usual folders. Its API key is kept apart, in an owner-only file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub soloist_path: Option<String>,
+    /// When Spotify Soloist plays the audio.
+    #[serde(default, skip_serializing_if = "soloist_is_off")]
+    pub soloist: SoloistUse,
 }
 
-fn playback_engine_is_default(engine: &PlaybackEngine) -> bool {
-    *engine == PlaybackEngine::Librespot
+fn soloist_is_off(soloist: &SoloistUse) -> bool {
+    *soloist == SoloistUse::Off
 }
 
 impl std::fmt::Debug for Settings {
@@ -543,8 +543,7 @@ impl Default for Settings {
             playback_authorized: false,
             keep_playing_in_background: true,
             tray_icon: TrayIcon::Colour,
-            playback_engine: PlaybackEngine::Librespot,
-            soloist_path: None,
+            soloist: SoloistUse::Off,
             mac_notch_widget: false,
             mac_show_in_dock: true,
             check_for_updates: true,
@@ -1669,6 +1668,16 @@ mod tests {
         let restored: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.proxy_mode, super::ProxyMode::Off);
         assert_eq!(restored.proxy_config().unwrap(), super::ProxyConfig::Off);
+    }
+
+    #[test]
+    fn an_unknown_soloist_value_reads_as_off_and_keeps_the_rest() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"device_name": "Den", "soloist": "fallback"}"#).unwrap();
+        assert_eq!(settings.soloist, crate::settings::SoloistUse::Off);
+        assert_eq!(settings.device_name, "Den");
+        let settings: Settings = serde_json::from_str(r#"{"soloist": "always"}"#).unwrap();
+        assert_eq!(settings.soloist, crate::settings::SoloistUse::Always);
     }
 
     #[test]
