@@ -382,21 +382,18 @@ impl KeptPlayer {
     }
 }
 
-/// What plays the audio.
-enum Output {
-    /// librespot's player, steered by its Spirc.
-    Librespot {
-        player: Arc<Player>,
-        spirc: Arc<Spirc>,
-        mixer: Arc<dyn Mixer>,
-        audio: Arc<AudioControl>,
-    },
-    /// A Spotify Soloist process (`crate::soloist`).
-    Soloist(Arc<crate::soloist::Soloist>),
-}
-
 pub struct Engine {
-    output: Output,
+    player: Arc<Player>,
+    spirc: Arc<Spirc>,
+    mixer: Arc<dyn Mixer>,
+    audio: Arc<AudioControl>,
+    /// Plays the audio instead of librespot's player, which stays a
+    /// Connect device of its own (`crate::soloist`). Soloist outlives this
+    /// engine: the backend's slot holds it across librespot's reconnects.
+    soloist: Option<Arc<crate::soloist::Soloist>>,
+    /// librespot's player's own state. The interface reads `state`, which is
+    /// this one unless Soloist plays.
+    librespot_state: Arc<Mutex<LocalState>>,
     session: Session,
     device_id: String,
     state: Arc<Mutex<LocalState>>,
@@ -408,6 +405,14 @@ pub struct Engine {
     /// The player came from a dropped session and still plays what that
     /// session left it, until something is loaded through this one.
     carrying: std::sync::atomic::AtomicBool,
+    /// Dropped with the engine, so its watchers know it is gone; only
+    /// their weak references read it.
+    _alive: Arc<()>,
+}
+
+/// Soloist's Connect name: librespot keeps the device name itself.
+pub fn soloist_device_name(device_name: &str) -> String {
+    format!("{device_name} (soloist)")
 }
 
 impl Engine {
@@ -417,6 +422,9 @@ impl Engine {
     /// Connects to Spotify and announces this device on Spotify Connect.
     /// A player `kept` from an engine whose session dropped plays on, and
     /// this engine takes it over, instead of starting a player of its own.
+    /// With Soloist configured, librespot still connects as its own device
+    /// but reports nothing to the interface; the Soloist in `slot` plays,
+    /// adopted from the previous engine when it is still running.
     pub async fn connect(
         config: &EngineConfig,
         proxy: Option<reqwest::Url>,
@@ -424,13 +432,32 @@ impl Engine {
         cache: Cache,
         notify: Notify,
         kept: Option<KeptPlayer>,
+        slot: crate::soloist::Slot,
     ) -> Result<Self> {
-        if let Some(soloist) = &config.soloist {
-            if let Some(kept) = kept {
-                kept.stop();
-            }
-            return Self::connect_soloist(config, soloist, proxy, credentials, cache, notify).await;
+        let soloist_config = config.soloist.clone();
+        if soloist_config.is_none() {
+            crate::soloist::stop_slot(&slot);
         }
+        // librespot's own playback state stays out of sight while Soloist
+        // plays; its session ending still reaches the backend.
+        let librespot_notify: Notify = if soloist_config.is_some() {
+            let notify = Arc::clone(&notify);
+            Arc::new(move |event| {
+                if !matches!(event, EngineEvent::State(_)) {
+                    notify(event);
+                }
+            })
+        } else {
+            Arc::clone(&notify)
+        };
+        let kept = match kept {
+            // librespot plays nothing beside Soloist, so nothing carries.
+            Some(kept) if soloist_config.is_some() => {
+                kept.stop();
+                None
+            }
+            kept => kept,
+        };
         let session_config = SessionConfig {
             device_id: config.device_id(),
             autoplay: Some(config.autoplay),
@@ -439,9 +466,9 @@ impl Engine {
         };
         let session = Session::new(session_config, Some(cache));
         let carrying = kept.is_some();
-        let (player, mixer, state, audio) = match kept {
+        let (player, mixer, librespot_state, audio) = match kept {
             Some(kept) => (kept.player, kept.mixer, kept.state, kept.audio),
-            None => Self::start_player(config, &session, &notify)?,
+            None => Self::start_player(config, &session, &librespot_notify)?,
         };
 
         let connect_config = ConnectConfig {
@@ -455,7 +482,7 @@ impl Engine {
         let (spirc, spirc_task) = Spirc::new(
             connect_config,
             session.clone(),
-            credentials,
+            credentials.clone(),
             Arc::clone(&player),
             Arc::clone(&mixer),
         )
@@ -469,10 +496,10 @@ impl Engine {
         }
 
         {
-            let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
+            let mut current = librespot_state.lock().unwrap_or_else(|p| p.into_inner());
             current.connected = true;
             current.username = session.username();
-            notify(EngineEvent::State(current.clone()));
+            librespot_notify(EngineEvent::State(current.clone()));
         }
 
         let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -480,8 +507,8 @@ impl Engine {
         let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
         let ended_flag = Arc::clone(&shutting_down);
         let ended_closing = Arc::clone(&closing);
-        let ended_notify = Arc::clone(&notify);
-        let ended_state = Arc::clone(&state);
+        let ended_notify = Arc::clone(&librespot_notify);
+        let ended_state = Arc::clone(&librespot_state);
         let ended_interrupted = Arc::clone(&interrupted);
         tokio::spawn(async move {
             spirc_task.await;
@@ -500,14 +527,59 @@ impl Engine {
             }
         });
 
-        let device_id = config.device_id();
+        let alive = Arc::new(());
+        let soloist = match &soloist_config {
+            None => None,
+            Some(soloist_config) => {
+                match Self::adopt_soloist(
+                    config,
+                    soloist_config,
+                    &session,
+                    &credentials,
+                    &notify,
+                    &slot,
+                )
+                .await
+                {
+                    Ok(soloist) => Some(soloist),
+                    Err(error) => {
+                        shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = spirc.shutdown();
+                        player.stop();
+                        return Err(error);
+                    }
+                }
+            }
+        };
+        if let Some(soloist) = &soloist {
+            // Soloist ending on its own, unlike librespot reconnecting, is
+            // this engine's to report: the next one starts a new Soloist.
+            let soloist = Arc::clone(soloist);
+            let engine = Arc::downgrade(&alive);
+            let shutting_down = Arc::clone(&shutting_down);
+            let notify = Arc::clone(&notify);
+            tokio::spawn(async move {
+                soloist.ended().await;
+                if engine.upgrade().is_some()
+                    && !shutting_down.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    log::warn!("Soloist stopped; starting it again");
+                    notify(EngineEvent::SessionEnded);
+                }
+            });
+        }
+
+        let (device_id, state) = match &soloist {
+            Some(soloist) => (soloist.device_id().to_string(), soloist.state()),
+            None => (config.device_id(), Arc::clone(&librespot_state)),
+        };
         Ok(Self {
-            output: Output::Librespot {
-                player,
-                spirc: Arc::new(spirc),
-                mixer,
-                audio,
-            },
+            player,
+            spirc: Arc::new(spirc),
+            mixer,
+            audio,
+            soloist,
+            librespot_state,
             session,
             device_id,
             state,
@@ -515,31 +587,34 @@ impl Engine {
             shutting_down,
             closing,
             carrying: std::sync::atomic::AtomicBool::new(carrying),
+            _alive: alive,
         })
     }
 
-    /// Connects the librespot session for reads only, with no player and
-    /// no Connect device of its own, and plays through Spotify Soloist.
-    async fn connect_soloist(
+    /// The slot's Soloist when it still runs with this configuration, now
+    /// reporting to `notify`; otherwise a new one, put in the slot.
+    async fn adopt_soloist(
         config: &EngineConfig,
-        soloist: &crate::soloist::SoloistConfig,
-        proxy: Option<reqwest::Url>,
-        credentials: Credentials,
-        cache: Cache,
-        notify: Notify,
-    ) -> Result<Self> {
-        let session_config = SessionConfig {
-            device_id: config.device_id(),
-            autoplay: Some(config.autoplay),
-            proxy,
-            ..SessionConfig::default()
-        };
-        let session = Session::new(session_config, Some(cache));
-        let _ = session.spclient().client_token().await;
-        session
-            .connect(credentials.clone(), true)
-            .await
-            .context("unable to connect to Spotify")?;
+        soloist_config: &crate::soloist::SoloistConfig,
+        session: &Session,
+        credentials: &Credentials,
+        notify: &Notify,
+        slot: &crate::soloist::Slot,
+    ) -> Result<Arc<crate::soloist::Soloist>> {
+        let name = soloist_device_name(&config.device_name);
+        let mut running = slot.lock().await;
+        if let Some(current) = running.as_ref()
+            && current.config == *soloist_config
+            && current.device_name == name
+            && !current.soloist.has_ended()
+        {
+            current.soloist.set_notify(Arc::clone(notify));
+            current.soloist.publish();
+            return Ok(Arc::clone(&current.soloist));
+        }
+        if let Some(previous) = running.take() {
+            previous.soloist.shutdown();
+        }
         // Also the credential Soloist is paired with, when it has none.
         let access_token = session
             .login5()
@@ -547,84 +622,32 @@ impl Engine {
             .await
             .ok()
             .map(|token| token.access_token);
-
         let state = Arc::new(Mutex::new(LocalState {
             volume: config.initial_volume,
             connected: true,
             username: session.username(),
             ..LocalState::default()
         }));
-        let player = match crate::soloist::Soloist::start(
-            soloist,
-            &config.device_name,
-            config.initial_volume,
-            &credentials,
-            access_token,
-            Arc::clone(&state),
-            Arc::clone(&notify),
-        )
-        .await
-        {
-            Ok(player) => Arc::new(player),
-            Err(error) => {
-                session.shutdown();
-                return Err(error);
-            }
-        };
-        notify(EngineEvent::State(
-            state.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-        ));
-
-        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
-        {
-            let shutting_down = Arc::clone(&shutting_down);
-            let closing = Arc::clone(&closing);
-            let state = Arc::clone(&state);
-            let interrupted = Arc::clone(&interrupted);
-            let session = session.clone();
-            let player = Arc::clone(&player);
-            tokio::spawn(async move {
-                // Either half ending ends the engine: the backend then
-                // reconnects both, which restarts Soloist too.
-                let session_gone = async {
-                    while !session.is_invalid() {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                    }
-                };
-                tokio::select! {
-                    () = player.ended() => {}
-                    () = session_gone => {}
-                }
-                player.shutdown();
-                session.shutdown();
-                let shut_down = shutting_down.load(std::sync::atomic::Ordering::SeqCst);
-                {
-                    let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
-                    *interrupted.lock().unwrap_or_else(|p| p.into_inner()) = current.interrupted();
-                    // Soloist's audio stopped with it.
-                    session_ended(&mut current, true);
-                    notify(EngineEvent::State(current.clone()));
-                }
-                if !shut_down && !closing.load(std::sync::atomic::Ordering::SeqCst) {
-                    notify(EngineEvent::SessionEnded);
-                }
-            });
-        }
-
-        let device_id = player.device_id().to_string();
+        let soloist = Arc::new(
+            crate::soloist::Soloist::start(
+                soloist_config,
+                &name,
+                config.initial_volume,
+                credentials,
+                access_token,
+                state,
+                Arc::clone(notify),
+            )
+            .await?,
+        );
+        soloist.publish();
+        *running = Some(crate::soloist::Running {
+            config: soloist_config.clone(),
+            device_name: name,
+            soloist: Arc::clone(&soloist),
+        });
         log::info!("playing through Spotify Soloist");
-        Ok(Self {
-            output: Output::Soloist(player),
-            session,
-            device_id,
-            state,
-            interrupted,
-            shutting_down,
-            closing,
-            carrying: std::sync::atomic::AtomicBool::new(false),
-        })
+        Ok(soloist)
     }
 
     /// A new player, with the mixer, output and state it plays through.
@@ -695,22 +718,17 @@ impl Engine {
     /// The player and what it plays through, for the engine that replaces
     /// this one after its session dropped. Nothing stops it: the song plays
     /// on until the next engine takes it over or [`KeptPlayer::stop`].
-    /// `None` with Soloist, whose audio ends with its process.
+    /// `None` beside Soloist, which plays on by itself.
     pub fn keep_player(&self) -> Option<KeptPlayer> {
-        match &self.output {
-            Output::Librespot {
-                player,
-                mixer,
-                audio,
-                ..
-            } => Some(KeptPlayer {
-                player: Arc::clone(player),
-                mixer: Arc::clone(mixer),
-                state: Arc::clone(&self.state),
-                audio: Arc::clone(audio),
-            }),
-            Output::Soloist(_) => None,
+        if self.soloist.is_some() {
+            return None;
         }
+        Some(KeptPlayer {
+            player: Arc::clone(&self.player),
+            mixer: Arc::clone(&self.mixer),
+            state: Arc::clone(&self.librespot_state),
+            audio: Arc::clone(&self.audio),
+        })
     }
 
     /// Whether the player still plays only what a dropped session left it:
@@ -726,6 +744,13 @@ impl Engine {
 
     /// Playback state to resume after replacing this engine.
     pub fn interrupted(&self) -> Option<Interrupted> {
+        if self.soloist.is_some() {
+            return self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .interrupted();
+        }
         let ended = self
             .interrupted
             .lock()
@@ -756,14 +781,14 @@ impl Engine {
     /// while the slider is still moving.
     fn note_volume(&self, volume: u16, preview: bool) -> Result<()> {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).volume = volume;
-        match &self.output {
-            Output::Librespot { spirc, mixer, .. } => {
-                mixer.set_volume(volume);
+        match &self.soloist {
+            Some(soloist) => soloist.set_volume(volume, preview)?,
+            None => {
+                self.mixer.set_volume(volume);
                 if !preview {
-                    spirc.set_volume(volume)?;
+                    self.spirc.set_volume(volume)?;
                 }
             }
-            Output::Soloist(soloist) => soloist.set_volume(volume, preview)?,
         }
         Ok(())
     }
@@ -814,19 +839,13 @@ impl Engine {
         &self.session
     }
 
+    /// Ends librespot. A Soloist beside it plays on: the backend stops it
+    /// when playback is no longer Soloist's (`crate::soloist::stop_slot`).
     pub fn shutdown(&self) {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        match &self.output {
-            Output::Librespot { player, spirc, .. } => {
-                let _ = spirc.shutdown();
-                player.stop();
-            }
-            Output::Soloist(soloist) => {
-                soloist.shutdown();
-                self.session.shutdown();
-            }
-        }
+        let _ = self.spirc.shutdown();
+        self.player.stop();
     }
 
     /// Ends the session but leaves the player playing, for an engine that
@@ -834,21 +853,17 @@ impl Engine {
     pub fn close_session(&self) {
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        match &self.output {
-            Output::Librespot { spirc, .. } => {
-                let _ = spirc.shutdown();
-            }
-            Output::Soloist(soloist) => {
-                soloist.shutdown();
-                self.session.shutdown();
-            }
-        }
+        let _ = self.spirc.shutdown();
     }
 
     pub fn resume_point(&self) -> Option<PlaybackResume> {
-        if let Output::Librespot { spirc, .. } = &self.output
-            && let Some(snapshot) = spirc.disconnected_playback()
-        {
+        if let Some(soloist) = &self.soloist {
+            // A running Soloist never stopped: nothing to pick up. One that
+            // ended takes up its song again in the next.
+            if !soloist.has_ended() {
+                return None;
+            }
+        } else if let Some(snapshot) = self.spirc.disconnected_playback() {
             return Some(PlaybackResume::Session(snapshot));
         }
         self.interrupted().map(|interrupted| {
@@ -870,17 +885,20 @@ impl Engine {
             .then(|| self.keep_player().and_then(|kept| kept.now()))
             .flatten();
         self.stop_carrying();
-        match (resume_from(resume, now.as_ref()), &self.output) {
-            (PlaybackResume::Session(snapshot), Output::Librespot { spirc, .. }) => {
-                spirc.restore_playback(snapshot).map_err(Into::into)
-            }
+        match resume_from(resume, now.as_ref()) {
             // A librespot snapshot means nothing to Soloist.
-            (PlaybackResume::Session(_), Output::Soloist(_)) => Ok(()),
-            (PlaybackResume::Track(spec), _) => self.send_command(PlayerCommand::Load(spec)),
+            PlaybackResume::Session(_) if self.soloist.is_some() => Ok(()),
+            PlaybackResume::Session(snapshot) => {
+                self.spirc.restore_playback(snapshot).map_err(Into::into)
+            }
+            PlaybackResume::Track(spec) => self.send_command(PlayerCommand::Load(spec)),
         }
     }
 
     pub fn command(&self, command: PlayerCommand) -> Result<()> {
+        if let Some(soloist) = &self.soloist {
+            return self.send_soloist(soloist, command);
+        }
         if matches!(command, PlayerCommand::Load(_) | PlayerCommand::Transfer) {
             // Something else chosen replaces the song a dropped session left.
             self.stop_carrying();
@@ -889,28 +907,21 @@ impl Engine {
             &self.state.lock().unwrap_or_else(|p| p.into_inner()),
             &command,
         );
-        let audio = match &self.output {
-            Output::Librespot { audio, .. } => Some(audio),
-            Output::Soloist(_) => None,
-        };
-        if interrupts_audio && let Some(audio) = audio {
-            audio.interrupt();
+        if interrupts_audio {
+            self.audio.interrupt();
         }
         let result = self.send_command(command);
-        if interrupts_audio
-            && result.is_err()
-            && let Some(audio) = audio
-        {
-            audio.stopped();
+        if interrupts_audio && result.is_err() {
+            self.audio.stopped();
         }
         result
     }
 
     fn send_command(&self, command: PlayerCommand) -> Result<()> {
-        let spirc = match &self.output {
-            Output::Librespot { spirc, .. } => spirc,
-            Output::Soloist(soloist) => return self.send_soloist(soloist, command),
-        };
+        if let Some(soloist) = &self.soloist {
+            return self.send_soloist(soloist, command);
+        }
+        let spirc = &self.spirc;
         match command {
             PlayerCommand::Toggle => spirc.play_pause()?,
             PlayerCommand::Next => spirc.next()?,

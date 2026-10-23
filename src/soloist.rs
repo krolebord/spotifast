@@ -63,6 +63,51 @@ pub struct SoloistConfig {
     pub cache_mb: Option<u64>,
 }
 
+/// The Soloist that outlives librespot's reconnects: Spotify drops that
+/// session every so often, and Soloist, with a connection of its own, plays
+/// on. The backend owns the slot; an engine adopts what it holds when the
+/// configuration still matches, and starts a new Soloist when not.
+pub struct Running {
+    pub config: SoloistConfig,
+    pub device_name: String,
+    pub soloist: Arc<Soloist>,
+}
+
+pub type Slot = Arc<tokio::sync::Mutex<Option<Running>>>;
+
+/// Stops the slot's Soloist: playback is no longer Soloist's to do.
+pub fn stop_slot(slot: &Slot) {
+    match slot.try_lock() {
+        Ok(mut running) => {
+            if let Some(running) = running.take() {
+                running.soloist.shutdown();
+            }
+        }
+        // An engine is starting one right now; stop it once it is in.
+        Err(_) => {
+            let slot = Arc::clone(slot);
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Some(running) = slot.lock().await.take() {
+                        running.soloist.shutdown();
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Whether the slot holds a Soloist that is still running.
+pub fn slot_alive(slot: &Slot) -> bool {
+    slot.try_lock()
+        .map(|running| {
+            running
+                .as_ref()
+                .is_some_and(|running| !running.soloist.has_ended())
+        })
+        .unwrap_or(true)
+}
+
 /// The Soloist executable: the configured path, else the first `soloist`
 /// on `PATH` or in the usual install folders. Only reads file metadata.
 pub fn find_binary(configured: Option<&str>) -> Option<PathBuf> {
@@ -93,6 +138,11 @@ pub fn find_binary(configured: Option<&str>) -> Option<PathBuf> {
 /// A running Soloist and the connection to its local API.
 pub struct Soloist {
     commands: mpsc::UnboundedSender<Value>,
+    /// What Soloist is playing, as the interface reads it. It outlives the
+    /// engines that come and go around it, so it is Soloist's own.
+    state: Arc<Mutex<LocalState>>,
+    /// Where state changes go: the current engine's channel to the app.
+    notify: Arc<Mutex<Notify>>,
     /// The process, for a stop that cannot wait on the runtime.
     pid: Option<u32>,
     stopping: std::sync::atomic::AtomicBool,
@@ -218,8 +268,9 @@ impl Soloist {
         });
 
         // Reader: events into the shared state.
+        let shared_notify = Arc::new(Mutex::new(Arc::clone(&notify)));
         let reader_state = Arc::clone(&state);
-        let reader_notify = Arc::clone(&notify);
+        let reader_notify = Arc::clone(&shared_notify);
         let reader_ended = ended_tx.clone();
         let reader_commands = commands.clone();
         tokio::spawn(async move {
@@ -252,7 +303,11 @@ impl Soloist {
                     apply_event(&mut current, &event, now_ms()).then(|| current.clone())
                 };
                 if let Some(snapshot) = snapshot {
-                    reader_notify(EngineEvent::State(snapshot));
+                    let notify = reader_notify
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    notify(EngineEvent::State(snapshot));
                 }
             }
             let _ = reader_ended.send(true);
@@ -293,6 +348,8 @@ impl Soloist {
 
         let mut soloist = Self {
             commands,
+            state: Arc::clone(&state),
+            notify: shared_notify,
             pid,
             stopping: std::sync::atomic::AtomicBool::new(false),
             device_id: String::new(),
@@ -435,6 +492,33 @@ impl Soloist {
     pub async fn ended(&self) {
         let mut ended = self.ended.clone();
         let _ = ended.wait_for(|ended| *ended).await;
+    }
+
+    /// Whether Soloist has exited or its API connection closed.
+    pub fn has_ended(&self) -> bool {
+        *self.ended.borrow()
+    }
+
+    /// What Soloist is playing.
+    pub fn state(&self) -> Arc<Mutex<LocalState>> {
+        Arc::clone(&self.state)
+    }
+
+    /// Sends state changes to `notify` from now on: the engine that
+    /// adopted this Soloist after the previous one's session dropped.
+    pub fn set_notify(&self, notify: Notify) {
+        *self.notify.lock().unwrap_or_else(|p| p.into_inner()) = notify;
+    }
+
+    /// The current snapshot, sent to the current engine's channel.
+    pub fn publish(&self) {
+        let snapshot = self.state.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let notify = self
+            .notify
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        notify(EngineEvent::State(snapshot));
     }
 
     /// Stops the Soloist process.
