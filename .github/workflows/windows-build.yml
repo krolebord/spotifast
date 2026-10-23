@@ -1,0 +1,75 @@
+name: Windows build
+
+# Builds Windows x86_64 on demand, as the release workflow's Windows job
+# does, but publishes nothing: the zip and installer are left as the run's
+# artifact.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: rustup target add x86_64-pc-windows-msvc
+      # libprojectM reads OpenGL through GLEW on Windows; projectm-sys builds
+      # against vcpkg's static-CRT triplet, matching .cargo/config.toml.
+      - name: GLEW for libprojectM
+        run: vcpkg install glew:x64-windows-static
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      - name: Verify standalone Windows runtime
+        shell: pwsh
+        run: |
+          $binary = "target\$env:TARGET\release\spotifast.exe"
+          $imports = & dumpbin /dependents $binary | Out-String
+          $runtime = $imports | Select-String -Pattern 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll'
+          if ($runtime) { throw "Spotifast imports an MSVC runtime:`n$runtime" }
+          $version = (& $binary --version | Out-String).Trim()
+          if ($version -notmatch '^spotifast \d+\.\d+\.\d+') { throw "Unexpected --version output: $version" }
+
+      - name: Package
+        shell: bash
+        run: |
+          name="spotifast-${GITHUB_SHA::7}-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/spotifast.exe" README.md LICENSE \
+            packaging/spotifast-portable.txt "dist/$name/"
+          cd dist && 7z a "$name.zip" "$name"
+
+      # Inno Setup ships with the runner image. PowerShell, because bash on
+      # Windows rewrites /D... arguments as paths.
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$version" "/DArch=x86_64" `
+            "/DBinary=$PWD\target\$env:TARGET\release\spotifast.exe" `
+            "/DOutputDir=$PWD\dist" packaging\windows\spotifast.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: spotifast-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
