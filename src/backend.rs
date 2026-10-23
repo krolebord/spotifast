@@ -705,8 +705,11 @@ pub enum Command {
     /// Find Spotify Soloist and read its build and accounts, off the UI
     /// thread: it runs `soloist --version`.
     InspectSoloist,
-    /// Download Spotify's newest Soloist build from Spotify's servers.
-    DownloadSoloist,
+    /// Download Spotify's newest Soloist build from Spotify's servers,
+    /// when the listener `asked`, or on Soloist's own daily check when due.
+    DownloadSoloist {
+        asked: bool,
+    },
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
     /// ask the person first.
@@ -972,8 +975,12 @@ pub struct LyricsRequest {
 pub enum Event {
     /// What `Command::InspectSoloist` found.
     SoloistInstall(crate::soloist::Install),
-    /// How `Command::DownloadSoloist` ended.
-    SoloistDownloaded(Result<crate::soloist::Downloaded, String>),
+    /// How `Command::DownloadSoloist` ended; a check that was not due
+    /// sends nothing.
+    SoloistDownloaded {
+        asked: bool,
+        result: Result<crate::soloist::Downloaded, String>,
+    },
     /// Soloist was paired from Spotify's app: its accounts changed.
     SoloistSignedIn,
     /// The folder picked in the local files dialog; `None` when cancelled.
@@ -2213,19 +2220,22 @@ impl Worker {
                         waker.wake();
                     });
                 }
-                Command::DownloadSoloist => {
+                Command::DownloadSoloist { asked } => {
                     let programs = self.dirs.soloist_programs_dir();
                     let proxy = self.engine_config.proxy.clone();
                     let events = self.events.clone();
                     let waker = self.waker.clone();
                     tokio::task::spawn_blocking(move || {
+                        if !asked && !crate::soloist::check_due(&programs) {
+                            return;
+                        }
                         let result = crate::soloist::download_client(&proxy)
                             .and_then(|client| crate::soloist::download(&client, &programs))
                             .map_err(|error| format!("{error:#}"));
                         if let Err(error) = &result {
                             log::warn!("Soloist download failed: {error}");
                         }
-                        let _ = events.send(Event::SoloistDownloaded(result));
+                        let _ = events.send(Event::SoloistDownloaded { asked, result });
                         waker.wake();
                     });
                 }
