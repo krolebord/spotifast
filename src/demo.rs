@@ -6320,6 +6320,11 @@ mod tests {
         accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         assert!(!app.soloist_downloading, "nothing is fetched unasked");
+        accessible_node(
+            &tree,
+            "Open the Spotify for Developers dashboard",
+            Role::Button,
+        );
         let download = accessible_node(&tree, "Download from Spotify", Role::Button);
         accessible_frame(
             &ctx,
