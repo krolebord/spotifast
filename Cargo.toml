@@ -192,6 +192,10 @@ pbkdf2 = "0.12"
 aes = "0.8"
 ctr = "0.9"
 
+[target.'cfg(unix)'.dependencies]
+# Signals for the Soloist child process (`src/soloist.rs`); already in the tree.
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # The packaged Dock artwork also identifies unbundled Cargo runs.
 fastframe-dock = { git = "https://github.com/crmne/fastframe", tag = "v0.14.1" }
