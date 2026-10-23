@@ -540,7 +540,13 @@ impl Engine {
             .connect(credentials.clone(), true)
             .await
             .context("unable to connect to Spotify")?;
-        let _ = session.login5().auth_token().await;
+        // Also the credential Soloist is paired with, when it has none.
+        let access_token = session
+            .login5()
+            .auth_token()
+            .await
+            .ok()
+            .map(|token| token.access_token);
 
         let state = Arc::new(Mutex::new(LocalState {
             volume: config.initial_volume,
@@ -553,6 +559,7 @@ impl Engine {
             &config.device_name,
             config.initial_volume,
             &credentials,
+            access_token,
             Arc::clone(&state),
             Arc::clone(&notify),
         )
