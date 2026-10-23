@@ -493,7 +493,7 @@ pub struct App {
     /// Local play history. See [`crate::history`].
     pub plays: crate::history::History,
     /// Writes settings, session and history off the UI thread.
-    files: fastframe_file::Writer,
+    pub(crate) files: fastframe_file::Writer,
     /// Current track timing used to decide when a play counts.
     listening: Option<Listening>,
     pub recents: crate::model::CursorList<crate::api::models::PlayHistory>,
@@ -13426,6 +13426,15 @@ pub fn engine_config(
         audio_cache_limit: Some(settings.audio_cache_mb.max(64) * 1024 * 1024),
         proxy,
         local_files: settings.local_files_folder(),
+        soloist: (settings.playback_engine == crate::settings::PlaybackEngine::Soloist).then(
+            || crate::soloist::SoloistConfig {
+                binary: settings.soloist_path.clone(),
+                key_file: dirs.soloist_key_file(),
+                data_dir: dirs.soloist_data_dir(),
+                cache_dir: settings.audio_cache.then(|| dirs.soloist_cache_dir()),
+                cache_mb: settings.audio_cache.then_some(settings.audio_cache_mb),
+            },
+        ),
     }
 }
 

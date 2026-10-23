@@ -160,6 +160,20 @@ impl AppDirs {
         self.state.join("proxy_password")
     }
 
+    /// The user's Spotify Soloist API key, owner-only, never in settings.json.
+    pub fn soloist_key_file(&self) -> PathBuf {
+        self.state.join("soloist_api_key")
+    }
+
+    /// Spotify Soloist's own data: its device identity and stored session.
+    pub fn soloist_data_dir(&self) -> PathBuf {
+        self.state.join("soloist")
+    }
+
+    pub fn soloist_cache_dir(&self) -> PathBuf {
+        self.cache.join("soloist")
+    }
+
     pub fn volume_dir(&self) -> PathBuf {
         self.state.join("volume")
     }

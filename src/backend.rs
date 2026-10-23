@@ -2346,7 +2346,7 @@ impl Worker {
                         Some(engine)
                             if command == PlayerCommand::Toggle
                                 && engine.carrying()
-                                && engine.keep_player().toggle() => {}
+                                && engine.keep_player().is_some_and(|kept| kept.toggle()) => {}
                         Some(engine) => {
                             if let Err(error) = engine.command(command) {
                                 self.emit(Event::Error(format!("Playback error: {error}")));
@@ -3635,7 +3635,7 @@ impl Worker {
             if !engine.carrying() || self.resume.is_none() {
                 self.resume = engine.resume_point();
             }
-            self.kept_player = Some(engine.keep_player());
+            self.kept_player = engine.keep_player();
         }
     }
 
@@ -4834,7 +4834,10 @@ impl Worker {
 fn friendly_connect_error(error: &anyhow::Error) -> String {
     let text = format!("{error:#}");
     let lower = text.to_lowercase();
-    if lower.contains("badcredentials") || lower.contains("bad credentials") {
+    if lower.contains("soloist") {
+        // Already written for the listener, with what to do next.
+        text
+    } else if lower.contains("badcredentials") || lower.contains("bad credentials") {
         "Spotify rejected the saved sign-in. Please sign in again.".to_string()
     } else if lower.contains("premium") {
         PREMIUM_NEEDED.to_string()

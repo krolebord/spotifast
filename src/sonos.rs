@@ -173,7 +173,7 @@ pub fn command_body(
 }
 
 /// Keeps a Spotify context intact or builds an ordered page for explicit tracks.
-fn play_command(request: &PlayRequest) -> Value {
+pub(crate) fn play_command(request: &PlayRequest) -> Value {
     let single = request
         .context_uri
         .as_deref()

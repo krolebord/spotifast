@@ -12,6 +12,41 @@ use crate::theme::{self, Icon, Palette};
 use super::widgets;
 
 const PLAYBACK_DIRTY_ID: &str = "playback-settings-dirty";
+/// The Soloist API key being typed; in memory only until saved.
+const SOLOIST_KEY_INPUT_ID: &str = "soloist-key-input";
+const SOLOIST_KEY_SAVED_ID: &str = "soloist-key-saved";
+const SOLOIST_FOUND_ID: &str = "soloist-found";
+
+/// Whether Spotify Soloist is installed and has a key, looked up once per
+/// configured path rather than every frame.
+struct SoloistStatus {
+    binary: Option<std::path::PathBuf>,
+    key_saved: bool,
+}
+
+fn soloist_status(app: &App, ui: &egui::Ui) -> SoloistStatus {
+    let configured = app.settings.soloist_path.clone().unwrap_or_default();
+    let found_id = egui::Id::new(SOLOIST_FOUND_ID);
+    let cached = ui.data(|data| data.get_temp::<(String, Option<std::path::PathBuf>)>(found_id));
+    let binary = match cached {
+        Some((path, binary)) if path == configured => binary,
+        _ => {
+            let binary = crate::soloist::find_binary(Some(&configured));
+            ui.data_mut(|data| data.insert_temp(found_id, (configured, binary.clone())));
+            binary
+        }
+    };
+    let saved_id = egui::Id::new(SOLOIST_KEY_SAVED_ID);
+    let key_saved = match ui.data(|data| data.get_temp::<bool>(saved_id)) {
+        Some(saved) => saved,
+        None => {
+            let saved = app.dirs.soloist_key_file().is_file();
+            ui.data_mut(|data| data.insert_temp(saved_id, saved));
+            saved
+        }
+    };
+    SoloistStatus { binary, key_saved }
+}
 pub(crate) const PERSONAL_APP_FOCUS_ID: &str = "focus-personal-app-setup";
 const SETTINGS_FILTER_ID: &str = "settings-filter";
 
@@ -640,6 +675,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let start_available = app
         .autostart
         .is_some_and(|state| state != fastframe_autostart::State::Unsupported);
+    let soloist = soloist_status(app, ui);
+    let soloist_chosen = app.settings.playback_engine == crate::settings::PlaybackEngine::Soloist;
+    let engine_detail = match (&soloist.binary, soloist_chosen) {
+        (Some(path), true) => gettext(
+            locale,
+            "Spotify Soloist, Spotify's own Connect receiver, plays the audio. Found at {path}. The equalizer and visualizers need librespot.",
+        )
+        .replace("{path}", &path.display().to_string()),
+        (Some(path), false) => gettext(
+            locale,
+            "librespot plays the audio. Spotify Soloist is installed at {path} and can play instead if Spotify refuses librespot's audio keys.",
+        )
+        .replace("{path}", &path.display().to_string()),
+        (None, _) => gettext(
+            locale,
+            "librespot plays the audio. Install Spotify Soloist from Spotify for Developers to choose it instead.",
+        )
+        .to_string(),
+    };
     let playback_rows = [
         RowText::new(
             // Translators: {status} is a playback state such as Ready or Not set up.
@@ -730,6 +784,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         )
         .when(!cfg!(target_os = "macos")),
         RowText::new(start_with_computer.clone(), start_detail).when(start_available),
+        RowText::new(gettext(locale, "Playback engine"), engine_detail),
+        RowText::new(
+            gettext(locale, "Soloist API key"),
+            if soloist.key_saved {
+                gettext(locale, "Saved on this computer, readable only by you. Paste a new key to replace it.")
+            } else {
+                gettext(locale, "Generate your own key under Spotify Soloist in the Spotify for Developers dashboard.")
+            },
+        )
+        .when(soloist_chosen),
+        RowText::new(
+            gettext(locale, "Soloist location"),
+            gettext(locale, "Leave empty to look on PATH, in ~/.local/bin and in Homebrew's folders."),
+        )
+        .when(soloist_chosen || app.settings.soloist_path.is_some()),
     ];
     if section_matches(&needle, &playback, &playback_rows) {
         any_visible = true;
@@ -769,6 +838,123 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     })
                     .inner;
                 if response.changed() {
+                    changed = true;
+                    playback_dirty = true;
+                }
+            });
+            let engines = [
+                (
+                    crate::settings::PlaybackEngine::Librespot,
+                    "librespot".to_string(),
+                ),
+                (
+                    crate::settings::PlaybackEngine::Soloist,
+                    "Soloist".to_string(),
+                ),
+            ];
+            let engines_width = engines
+                .iter()
+                .map(|(_, label)| theme::soft_button_width(ui, label))
+                .sum::<f32>()
+                + 6.0;
+            filtered_row_sized(
+                ui,
+                &palette,
+                &needle,
+                &playback,
+                &playback_rows[18],
+                engines_width,
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        // Laid right to left, so the last choice goes first.
+                        for (engine, label) in engines.iter().rev() {
+                            let available = *engine != crate::settings::PlaybackEngine::Soloist
+                                || soloist.binary.is_some()
+                                || soloist_chosen;
+                            let chosen = app.settings.playback_engine == *engine;
+                            let clicked = ui
+                                .add_enabled_ui(available, |ui| {
+                                    theme::soft_button(ui, &palette, None, label, chosen)
+                                })
+                                .inner
+                                .clicked();
+                            if clicked && !chosen {
+                                app.settings.playback_engine = *engine;
+                                changed = true;
+                                playback_dirty = true;
+                            }
+                        }
+                    });
+                },
+            );
+            filtered_row(ui, &palette, &needle, &playback, &playback_rows[19], |ui| {
+                let input_id = egui::Id::new(SOLOIST_KEY_INPUT_ID);
+                let mut key = ui
+                    .data(|data| data.get_temp::<String>(input_id))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    let save = gettext(locale, "Save key");
+                    // Laid right to left: the button sits at the edge.
+                    let clicked = theme::soft_button(ui, &palette, None, &save, false).clicked();
+                    Frame::new()
+                        .fill(palette.surface)
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            widgets::text_edit(
+                                ui,
+                                locale,
+                                egui::TextEdit::singleline(&mut key)
+                                    .password(true)
+                                    .hint_text(if soloist.key_saved {
+                                        "••••••••"
+                                    } else {
+                                        ""
+                                    })
+                                    .font(theme::regular(14.0))
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(160.0),
+                            )
+                        });
+                    if clicked && !key.trim().is_empty() {
+                        let path = app.dirs.soloist_key_file();
+                        app.files.write_or(
+                            &path,
+                            key.trim().as_bytes().to_vec(),
+                            fastframe_file::Access::Private,
+                            || log::error!("unable to save the Soloist API key"),
+                        );
+                        key.clear();
+                        ui.data_mut(|data| {
+                            data.insert_temp(egui::Id::new(SOLOIST_KEY_SAVED_ID), true)
+                        });
+                        playback_dirty = true;
+                    }
+                });
+                ui.data_mut(|data| data.insert_temp(input_id, key));
+            });
+            filtered_row(ui, &palette, &needle, &playback, &playback_rows[20], |ui| {
+                let mut path = app.settings.soloist_path.clone().unwrap_or_default();
+                let response = Frame::new()
+                    .fill(palette.surface)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        widgets::text_edit(
+                            ui,
+                            locale,
+                            egui::TextEdit::singleline(&mut path)
+                                .hint_text(crate::soloist::BINARY)
+                                .font(theme::regular(14.0))
+                                .frame(egui::Frame::NONE)
+                                .desired_width(200.0),
+                        )
+                    })
+                    .inner;
+                if response.changed() {
+                    app.settings.soloist_path =
+                        (!path.trim().is_empty()).then(|| path.trim().to_string());
                     changed = true;
                     playback_dirty = true;
                 }
