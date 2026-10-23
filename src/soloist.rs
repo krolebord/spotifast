@@ -9,9 +9,11 @@
 //! [`LocalState`] librespot's player reports, so the interface cannot tell
 //! the two apart.
 //!
-//! Soloist is not redistributable: it is found on this computer, never
-//! bundled. Its API key is the user's own, read from an owner-only file and
-//! handed to the process at startup; it is never logged.
+//! Soloist is not redistributable: Spotifast never bundles it. When the
+//! user asks, it downloads Spotify's own archive from Spotify's servers into
+//! its data folder, and replaces it the same way when a build nears expiry.
+//! Its API key is the user's own, read from an owner-only file and handed to
+//! the process at startup; it is never logged.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,6 +45,8 @@ const EXIT_EXPIRED: i32 = 10;
 const START_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long a restored session may take to report itself logged in.
 const RESTORE_WAIT: Duration = Duration::from_secs(4);
+/// How often an unpaired Soloist is asked whether it has signed in.
+const PAIRING_POLL: Duration = Duration::from_secs(2);
 /// Where Soloist keeps its Connect device id, in its data directory.
 const DEVICE_ID_FILE: &str = ".device_id";
 /// Volume drags are forwarded at most this often.
@@ -51,8 +55,10 @@ const PREVIEW_INTERVAL: Duration = Duration::from_millis(80);
 /// Where Soloist lives and keeps its state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SoloistConfig {
-    /// A path set in Settings, or `None` to look in the usual places.
-    pub binary: Option<String>,
+    /// Where downloaded builds are kept (`find_binary`). The build itself
+    /// is not part of the configuration: a newer one, downloaded while
+    /// Soloist plays, takes over at its next start.
+    pub programs: PathBuf,
     /// Owner-only file holding the user's Soloist API key.
     pub key_file: PathBuf,
     /// Soloist's own data directory: device identity and stored session.
@@ -106,31 +112,380 @@ pub fn slot_alive(slot: &Slot) -> bool {
         .unwrap_or(true)
 }
 
-/// The Soloist executable: the configured path, else the first `soloist`
-/// on `PATH` or in the usual install folders. Only reads file metadata.
-pub fn find_binary(configured: Option<&str>) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    if let Some(path) = configured.map(str::trim).filter(|path| !path.is_empty()) {
-        let path = match (path.strip_prefix("~/"), &home) {
-            (Some(rest), Some(home)) => home.join(rest),
-            _ => PathBuf::from(path),
-        };
-        return path.is_file().then_some(path);
+/// Names a Soloist executable to use instead of the downloaded one, for
+/// trying a particular build.
+pub const BINARY_ENV: &str = "SPOTIFAST_SOLOIST";
+
+/// The Soloist to run: `SPOTIFAST_SOLOIST` when set, else the newest build
+/// downloaded into `programs`. Only reads file metadata.
+pub fn find_binary(programs: &Path) -> Option<PathBuf> {
+    match binary_override() {
+        Some(path) => path.is_file().then_some(path),
+        None => installed(programs).map(|(_, path)| path),
     }
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).collect())
-        .unwrap_or_default();
-    if let Some(home) = &home {
-        dirs.push(home.join(".local/bin"));
-        dirs.push(home.join("bin"));
-        dirs.push(home.join("soloist"));
-        dirs.push(home.join("Applications/soloist"));
+}
+
+fn binary_override() -> Option<PathBuf> {
+    std::env::var_os(BINARY_ENV)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Each downloaded build sits in a folder named for its build time, so a
+/// newer one can arrive while an older one runs (Windows cannot replace a
+/// running executable), and the highest is the one to start.
+fn installed(programs: &Path) -> Option<(i64, PathBuf)> {
+    std::fs::read_dir(programs)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let built = entry.file_name().to_str()?.parse::<i64>().ok()?;
+            let binary = entry.path().join(BINARY);
+            binary.is_file().then_some((built, binary))
+        })
+        .max_by_key(|(built, _)| *built)
+}
+
+/// Where Spotify publishes new Soloist builds, with their terms and licenses.
+pub const DOWNLOADS_URL: &str =
+    "https://developer.spotify.com/documentation/soloist/reference/downloads-and-updates";
+/// Spotify's server for the archives `DOWNLOADS_URL` links to.
+const ARCHIVES_URL: &str = "https://soloist-builds.spotifycdn.com/";
+/// A download may be redirected only within Spotify's own servers.
+const ARCHIVE_HOSTS: [&str; 2] = ["spotifycdn.com", "spotify.com"];
+/// Archives are about 10 MB and the program about 25 MB; a larger answer
+/// is not a Soloist build and must not fill the disk.
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Spotify's archive for this computer, or `None` where it publishes none
+/// (Intel Macs, among others).
+pub const ARCHIVE: Option<&str> = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    Some("soloist_release_osx_arm64.tar.gz")
+} else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+    Some("soloist_release_windows_x86_64.zip")
+} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+    Some("soloist_release_x86_64.tar.gz")
+} else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+    Some("soloist_release_arm64.tar.gz")
+} else if cfg!(all(target_os = "linux", target_arch = "arm")) {
+    Some("soloist_release_arm32.tar.gz")
+} else {
+    None
+};
+
+/// Whether a download may follow a redirect to `host`.
+fn archive_host(host: &str) -> bool {
+    ARCHIVE_HOSTS
+        .iter()
+        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+}
+
+/// The client for `download`: the user's proxy, redirects only within
+/// Spotify's servers, and time enough for a slow connection.
+pub fn download_client(proxy: &crate::settings::ProxyConfig) -> Result<reqwest::blocking::Client> {
+    let redirects = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            attempt.error("too many redirects")
+        } else if attempt.url().scheme() == "https"
+            && attempt.url().host_str().is_some_and(archive_host)
+        {
+            attempt.follow()
+        } else {
+            attempt.error("redirected away from Spotify's servers")
+        }
+    });
+    crate::http::blocking_builder(proxy)
+        .map_err(|error| anyhow!(error))?
+        .redirect(redirects)
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|error| anyhow!(error.without_url().to_string()))
+}
+
+/// What `download` brought in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Downloaded {
+    pub build: Build,
+    /// `false` when Spotify's newest build is the one already here.
+    pub new: bool,
+}
+
+/// Blocking: downloads Spotify's newest Soloist for this computer into
+/// `programs`, checks that it runs and has not expired, and removes the
+/// builds it replaces. A failure leaves the installed build as it was.
+pub fn download(client: &reqwest::blocking::Client, programs: &Path) -> Result<Downloaded> {
+    let archive = ARCHIVE.context("Spotify publishes no Soloist build for this computer")?;
+    std::fs::create_dir_all(programs).context("unable to create Soloist's program folder")?;
+    // Not a build time, so `installed` never picks it.
+    let staging = programs.join(format!(".download-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).context("unable to create a download folder")?;
+    let result = download_into(client, archive, &staging, programs);
+    let _ = std::fs::remove_dir_all(&staging);
+    let downloaded = result?;
+    // Older builds; one still running on Windows stays until next time.
+    if let Ok(entries) = std::fs::read_dir(programs) {
+        for entry in entries.filter_map(Result::ok) {
+            let older = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i64>().ok())
+                .is_some_and(|built| built < downloaded.build.built.as_second());
+            if older {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
-    dirs.push("/opt/homebrew/bin".into());
-    dirs.push("/usr/local/bin".into());
-    dirs.into_iter()
-        .map(|dir| dir.join(BINARY))
-        .find(|path| path.is_file())
+    Ok(downloaded)
+}
+
+fn download_into(
+    client: &reqwest::blocking::Client,
+    archive: &str,
+    staging: &Path,
+    programs: &Path,
+) -> Result<Downloaded> {
+    use std::io::Read;
+    let response = client
+        .get(format!("{ARCHIVES_URL}{archive}"))
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| anyhow!("unable to download Soloist: {}", error.without_url()))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_ARCHIVE_BYTES)
+    {
+        bail!("Spotify's answer is too large to be a Soloist build");
+    }
+    let archive_path = staging.join(archive);
+    let mut file =
+        std::fs::File::create(&archive_path).context("unable to save the Soloist download")?;
+    let copied = std::io::copy(&mut response.take(MAX_ARCHIVE_BYTES + 1), &mut file)
+        .context("the Soloist download was interrupted")?;
+    if copied > MAX_ARCHIVE_BYTES {
+        bail!("Spotify's answer is too large to be a Soloist build");
+    }
+    file.sync_all()
+        .context("unable to save the Soloist download")?;
+    drop(file);
+    install_archive(&archive_path, staging, programs)
+}
+
+/// Unpacks the program from Spotify's archive and installs it under its
+/// build time once it runs.
+fn install_archive(archive_path: &Path, staging: &Path, programs: &Path) -> Result<Downloaded> {
+    // The system's tar reads both archive kinds (Windows 10 ships bsdtar),
+    // and naming the one member keeps anything else in it out.
+    let unpacked = staging.join("build");
+    std::fs::create_dir_all(&unpacked).context("unable to create a download folder")?;
+    let status = std::process::Command::new("tar")
+        .arg("-xf")
+        .arg(archive_path)
+        .arg("-C")
+        .arg(&unpacked)
+        .arg(BINARY)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .context("unable to run tar to unpack Soloist")?;
+    let binary = unpacked.join(BINARY);
+    let size = std::fs::metadata(&binary).map(|meta| meta.len()).ok();
+    if !status.success() || size.is_none_or(|size| size == 0 || size > MAX_BINARY_BYTES) {
+        bail!("Spotify's archive does not hold a Soloist program");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .context("unable to make Soloist runnable")?;
+    }
+    let build = read_build(&binary).context("the downloaded program is not a Soloist build")?;
+    if days_left(&build, jiff::Timestamp::now()) < 0 {
+        bail!("Spotify's newest Soloist build has already expired");
+    }
+    let target = programs.join(build.built.as_second().to_string());
+    if target.join(BINARY).is_file() {
+        return Ok(Downloaded { build, new: false });
+    }
+    let _ = std::fs::remove_dir_all(&target);
+    std::fs::rename(&unpacked, &target).context("unable to install the Soloist download")?;
+    Ok(Downloaded { build, new: true })
+}
+/// Soloist builds stop working this many days after they were built.
+pub const LIFETIME_DAYS: i64 = 90;
+
+/// An installed Soloist build, as `soloist --version` describes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Build {
+    pub version: String,
+    pub built: jiff::Timestamp,
+}
+
+impl Build {
+    /// When this build stops working.
+    pub fn expires(&self) -> jiff::Timestamp {
+        self.built
+            .checked_add(jiff::SignedDuration::from_hours(LIFETIME_DAYS * 24))
+            .unwrap_or(self.built)
+    }
+}
+
+/// "soloist 1.3.10.12 build 1792756912 (20261023) (g19412df6ea) (…)": the
+/// version, and the build's Unix time.
+pub fn parse_version(text: &str) -> Option<Build> {
+    let mut words = text.split_whitespace();
+    words.find(|word| *word == "soloist")?;
+    let version = words.next()?.to_string();
+    if words.next()? != "build" {
+        return None;
+    }
+    let built = jiff::Timestamp::from_second(words.next()?.parse().ok()?).ok()?;
+    Some(Build { version, built })
+}
+
+/// Blocking: runs `binary --version`.
+pub fn read_build(binary: &Path) -> Option<Build> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Blocking: the accounts Soloist has signed in to with `data_dir`. It
+/// keeps a `settings/Users/<username>-user` folder for each.
+pub fn accounts(data_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(data_dir.join("settings").join("Users")) else {
+        return Vec::new();
+    };
+    let mut accounts: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_suffix("-user")
+                .map(str::to_string)
+        })
+        .collect();
+    accounts.sort();
+    accounts
+}
+
+/// What the Settings page shows about the Soloist on this computer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Install {
+    pub binary: Option<PathBuf>,
+    /// `binary` is the one `SPOTIFAST_SOLOIST` names, not a download.
+    pub overridden: bool,
+    pub build: Option<Build>,
+    pub accounts: Vec<String>,
+    /// The API key file exists.
+    pub key_saved: bool,
+}
+
+/// Blocking: finds Soloist and reads its build, accounts and key file.
+pub fn inspect(programs: &Path, data_dir: &Path, key_file: &Path) -> Install {
+    let binary = find_binary(programs);
+    let build = binary.as_deref().and_then(read_build);
+    Install {
+        binary,
+        overridden: binary_override().is_some(),
+        build,
+        accounts: accounts(data_dir),
+        key_saved: key_file.is_file(),
+    }
+}
+
+/// Days left before the build expires is "soon" from this many.
+pub const EXPIRY_WARNING_DAYS: i64 = 14;
+
+/// Whom Soloist's stored session belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Paired {
+    /// The account Spotifast is signed in to.
+    ThisAccount,
+    /// Only other accounts.
+    OtherAccount,
+    /// No account yet.
+    No,
+}
+
+/// Matches Soloist's accounts against Spotifast's, while that is known.
+pub fn paired(install: &Install, account: Option<&str>) -> Paired {
+    if install.accounts.is_empty() {
+        Paired::No
+    } else if account.is_none_or(|account| install.accounts.iter().any(|held| held == account)) {
+        Paired::ThisAccount
+    } else {
+        Paired::OtherAccount
+    }
+}
+
+/// The next thing Soloist needs, for the section's status line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Checking,
+    NotFound,
+    Expired,
+    NeedsKey,
+    NeedsPairing,
+    OtherAccount,
+    ExpiringSoon { days: i64 },
+    Ready,
+}
+
+/// What Settings knows about Soloist, gathered for `readiness`.
+pub struct Facts<'a> {
+    pub install: Option<&'a Install>,
+    pub key_saved: bool,
+    pub account: Option<&'a str>,
+    /// The running Soloist reported it has no session.
+    pub signed_out: bool,
+    pub now: jiff::Timestamp,
+}
+
+/// Days from `now` until `build` expires; negative once it has.
+pub fn days_left(build: &Build, now: jiff::Timestamp) -> i64 {
+    (build.expires().as_second() - now.as_second()).div_euclid(86_400)
+}
+
+pub fn readiness(facts: &Facts<'_>) -> Readiness {
+    let Some(install) = facts.install else {
+        return Readiness::Checking;
+    };
+    if install.binary.is_none() {
+        return Readiness::NotFound;
+    }
+    let days = install
+        .build
+        .as_ref()
+        .map(|build| days_left(build, facts.now));
+    if days.is_some_and(|days| days < 0) {
+        return Readiness::Expired;
+    }
+    if !facts.key_saved {
+        return Readiness::NeedsKey;
+    }
+    match paired(install, facts.account) {
+        Paired::No => return Readiness::NeedsPairing,
+        Paired::OtherAccount => return Readiness::OtherAccount,
+        Paired::ThisAccount if facts.signed_out => return Readiness::NeedsPairing,
+        Paired::ThisAccount => {}
+    }
+    match days {
+        Some(days) if days < EXPIRY_WARNING_DAYS => Readiness::ExpiringSoon { days },
+        _ => Readiness::Ready,
+    }
+}
+
+/// Whether an engine error is Soloist waiting to be paired.
+pub fn is_pairing_needed(error: &str) -> bool {
+    error.starts_with(PAIRING_NEEDED)
 }
 
 /// A running Soloist and the connection to its local API.
@@ -160,9 +515,9 @@ impl Soloist {
         state: Arc<Mutex<LocalState>>,
         notify: Notify,
     ) -> Result<Self> {
-        let binary = find_binary(config.binary.as_deref()).ok_or_else(|| {
+        let binary = find_binary(&config.programs).ok_or_else(|| {
             anyhow!(
-                "Spotify Soloist was not found. Install it from Spotify for Developers, or switch playback back to librespot in Settings."
+                "Spotify Soloist is not downloaded yet. Download it in Settings, under Spotify Soloist, or turn Use Soloist off."
             )
         })?;
         let key = read_key(&config.key_file).await?;
@@ -284,6 +639,11 @@ impl Soloist {
                         // Paired after the engine started: catch up.
                         let _ = reader_commands
                             .send(json!({ "type": "command", "command": "get_state" }));
+                        let notify = reader_notify
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .clone();
+                        notify(EngineEvent::SoloistSignedIn);
                     }
                 }
                 if event["type"] == "error" {
@@ -314,7 +674,7 @@ impl Soloist {
                 status = child.wait() => {
                     let message = match status.ok().and_then(|status| status.code()) {
                         Some(EXIT_EXPIRED) => Some(
-                            "This Spotify Soloist build has expired. Download a newer build from Spotify for Developers."
+                            "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
                                 .to_string(),
                         ),
                         Some(0) => None,
@@ -355,14 +715,28 @@ impl Soloist {
             Ok((device_id, paired)) => {
                 soloist.device_id = device_id;
                 if !paired {
-                    // Soloist keeps waiting; pairing it once from Terminal
-                    // stores a session, and its sign-in event clears this.
+                    // Soloist keeps waiting for a pick in Spotify's app; its
+                    // sign-in clears this. It does not always announce one,
+                    // so it is asked until it has signed in or stopped.
                     let snapshot = {
                         let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
-                        current.error = Some(pairing_needed(&binary, config, device_name));
+                        current.error = Some(pairing_needed(device_name));
                         current.clone()
                     };
                     notify(EngineEvent::State(snapshot));
+                    let commands = soloist.commands.clone();
+                    let mut auth = auth.clone();
+                    tokio::spawn(async move {
+                        while auth.borrow_and_update().is_none_or(|logged_in| !logged_in) {
+                            if commands
+                                .send(json!({ "type": "command", "command": "get_auth_state" }))
+                                .is_err()
+                            {
+                                return;
+                            }
+                            let _ = tokio::time::timeout(PAIRING_POLL, auth.changed()).await;
+                        }
+                    });
                 }
                 Ok(soloist)
             }
@@ -374,9 +748,10 @@ impl Soloist {
     }
 
     /// Waits for a stored session and returns Soloist's Connect device id,
-    /// and whether it signed in. Spotifast does not pair Soloist itself:
-    /// handing it the playback account over ZeroConf did not work, so an
-    /// unpaired Soloist waits to be paired once from Terminal.
+    /// and whether it signed in. Spotifast does not hand Soloist the account
+    /// (over ZeroConf that did not work): an unpaired Soloist waits for a
+    /// pick in Spotify's app, which macOS lets the phone see only while
+    /// Spotifast runs as an app allowed on the local network.
     async fn sign_in(
         &self,
         config: &SoloistConfig,
@@ -590,14 +965,9 @@ async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) 
 /// The start of the message shown while Soloist waits to be paired.
 const PAIRING_NEEDED: &str = "Soloist is waiting to be paired.";
 
-/// How to pair Soloist once. Soloist locks its data folder, so Spotifast
-/// has to be closed meanwhile; the key is read from its file, never shown.
-fn pairing_needed(binary: &Path, config: &SoloistConfig, device_name: &str) -> String {
+fn pairing_needed(device_name: &str) -> String {
     format!(
-        "{PAIRING_NEEDED} Quit Spotifast, run this in Terminal, and choose \"{device_name}\" in the Spotify app on your phone, on the same Wi-Fi: \"{}\" --pair --device-name \"{device_name}\" --data-dir \"{}\" --api-key \"$(cat \"{}\")\"",
-        binary.display(),
-        config.data_dir.display(),
-        config.key_file.display(),
+        "{PAIRING_NEEDED} In the Spotify app on your phone, on the same Wi-Fi, choose \"{device_name}\" once."
     )
 }
 
@@ -639,7 +1009,7 @@ async fn wait_for_port(child: &mut tokio::process::Child, port_file: &Path) -> R
         if let Some(status) = child.try_wait()? {
             return Err(match status.code() {
                 Some(EXIT_EXPIRED) => anyhow!(
-                    "This Spotify Soloist build has expired. Download a newer build from Spotify for Developers."
+                    "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
                 ),
                 code => anyhow!(
                     "Spotify Soloist exited while starting (exit code {}). Check its API key; the log has details.",
@@ -1081,6 +1451,200 @@ fn local_track(item: &Value) -> Option<LocalTrack> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_names_the_next_missing_step() {
+        let built = jiff::Timestamp::from_second(1_792_756_912).unwrap();
+        let day = jiff::SignedDuration::from_hours(24);
+        let install = Install {
+            binary: Some("/bin/soloist".into()),
+            overridden: false,
+            build: Some(Build {
+                version: "1".into(),
+                built,
+            }),
+            accounts: vec!["alice".into()],
+            key_saved: true,
+        };
+        fn facts(install: Option<&Install>, now: jiff::Timestamp) -> Facts<'_> {
+            Facts {
+                install,
+                key_saved: true,
+                account: Some("alice"),
+                signed_out: false,
+                now,
+            }
+        }
+        let now = built.checked_add(day * 10).unwrap();
+        assert_eq!(readiness(&facts(None, now)), Readiness::Checking);
+        assert_eq!(readiness(&facts(Some(&install), now)), Readiness::Ready);
+        let missing = Install {
+            binary: None,
+            ..install.clone()
+        };
+        assert_eq!(readiness(&facts(Some(&missing), now)), Readiness::NotFound);
+        let soon = built.checked_add(day * 80).unwrap();
+        assert_eq!(
+            readiness(&facts(Some(&install), soon)),
+            Readiness::ExpiringSoon { days: 10 }
+        );
+        let late = built.checked_add(day * 91).unwrap();
+        assert_eq!(readiness(&facts(Some(&install), late)), Readiness::Expired);
+        let mut keyless = facts(Some(&install), now);
+        keyless.key_saved = false;
+        assert_eq!(readiness(&keyless), Readiness::NeedsKey);
+        let mut signed_out = facts(Some(&install), now);
+        signed_out.signed_out = true;
+        assert_eq!(readiness(&signed_out), Readiness::NeedsPairing);
+        let mut other = facts(Some(&install), now);
+        other.account = Some("bob");
+        assert_eq!(readiness(&other), Readiness::OtherAccount);
+        let unpaired = Install {
+            accounts: Vec::new(),
+            ..install.clone()
+        };
+        assert_eq!(
+            readiness(&facts(Some(&unpaired), now)),
+            Readiness::NeedsPairing
+        );
+    }
+
+    #[test]
+    fn the_build_and_its_expiry_are_read_from_the_version() {
+        let build = parse_version(
+            "soloist 1.3.10.12 build 1792756912 (20261023) (g19412df6ea) (macos/aarch64)\n",
+        )
+        .unwrap();
+        assert_eq!(build.version, "1.3.10.12");
+        assert_eq!(build.built.as_second(), 1_792_756_912);
+        assert_eq!(build.expires().to_string(), "2027-01-21T12:01:52Z");
+        assert!(parse_version("something else").is_none());
+    }
+
+    #[test]
+    fn accounts_are_read_from_soloists_user_folders() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-soloist-accounts-{}", std::process::id()));
+        let users = dir.join("settings").join("Users");
+        std::fs::create_dir_all(users.join("alice-user")).unwrap();
+        std::fs::create_dir_all(users.join("not-an-account")).unwrap();
+        std::fs::write(users.join("bob-user"), "").unwrap();
+        assert_eq!(accounts(&dir), ["alice"]);
+        assert!(accounts(&dir.join("missing")).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_newest_downloaded_build_is_the_one_to_run() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-soloist-builds-{}", std::process::id()));
+        for build in ["1792756912", "1792778483", ".download-1"] {
+            std::fs::create_dir_all(dir.join(build)).unwrap();
+            std::fs::write(dir.join(build).join(BINARY), "").unwrap();
+        }
+        // A folder without the program, as an interrupted removal leaves.
+        std::fs::create_dir_all(dir.join("1799999999")).unwrap();
+        assert_eq!(
+            installed(&dir),
+            Some((1_792_778_483, dir.join("1792778483").join(BINARY)))
+        );
+        assert_eq!(installed(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn downloads_follow_redirects_only_within_spotify() {
+        assert!(archive_host("soloist-builds.spotifycdn.com"));
+        assert!(archive_host("spotify.com"));
+        assert!(!archive_host("notspotify.com"));
+        assert!(!archive_host("spotifycdn.com.example.net"));
+    }
+
+    /// Spotify's archive holds the program beside its changelog and
+    /// licenses; only a program that answers `--version` is installed.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_installs_under_its_build_time() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-soloist-archive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let built = jiff::Timestamp::now().as_second() - 86_400;
+        std::fs::write(
+            source.join(BINARY),
+            format!("#!/bin/sh\necho 'soloist 1.3.10.13 build {built} (x)'\n"),
+        )
+        .unwrap();
+        std::fs::write(source.join("CHANGELOG.md"), "").unwrap();
+        let archive = dir.join("soloist.tar.gz");
+        let packed = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&source)
+            .args([BINARY, "CHANGELOG.md"])
+            .status()
+            .unwrap();
+        assert!(packed.success());
+        let programs = dir.join("programs");
+        let staging = programs.join(".download-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        let downloaded = install_archive(&archive, &staging, &programs).unwrap();
+        assert!(downloaded.new);
+        assert_eq!(downloaded.build.version, "1.3.10.13");
+        let program = programs.join(built.to_string()).join(BINARY);
+        assert_eq!(find_binary_in(&programs), Some(program.clone()));
+        assert!(
+            !programs
+                .join(built.to_string())
+                .join("CHANGELOG.md")
+                .exists()
+        );
+
+        // The same build again is not new, and the installed one stays.
+        std::fs::create_dir_all(&staging).unwrap();
+        let again = install_archive(&archive, &staging, &programs).unwrap();
+        assert!(!again.new);
+        assert!(program.is_file());
+
+        // An archive without the program installs nothing.
+        let empty = dir.join("empty.tar.gz");
+        std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&empty)
+            .arg("-C")
+            .arg(&source)
+            .arg("CHANGELOG.md")
+            .status()
+            .unwrap();
+        let other = dir.join("other");
+        std::fs::create_dir_all(other.join("staging")).unwrap();
+        assert!(install_archive(&empty, &other.join("staging"), &other).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Run by hand: `cargo test --lib soloist::tests::downloads -- --ignored`.
+    #[test]
+    #[ignore = "downloads Soloist from Spotify"]
+    fn downloads_spotifys_newest_build() {
+        // About 25 MB: kept out of the small temporary filesystem.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/soloist-download-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let client = download_client(&crate::settings::ProxyConfig::System).unwrap();
+        let downloaded = download(&client, &dir).unwrap();
+        assert!(downloaded.new);
+        assert_eq!(
+            read_build(&find_binary_in(&dir).unwrap()),
+            Some(downloaded.build)
+        );
+        assert!(!download(&client, &dir).unwrap().new);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn find_binary_in(programs: &Path) -> Option<PathBuf> {
+        installed(programs).map(|(_, path)| path)
+    }
 
     fn track_event() -> Value {
         json!({

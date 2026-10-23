@@ -684,6 +684,15 @@ pub struct App {
     /// The banner saying Spotify refused this computer a song's audio key
     /// is up. It takes the slow banner's place while both are due.
     pub audio_key_banner: bool,
+    /// The Soloist install Settings shows; `None` until the backend has
+    /// looked.
+    pub soloist_install: Option<crate::soloist::Install>,
+    /// The backend was asked; cleared to ask again after a change.
+    pub soloist_inspected: bool,
+    /// A Soloist download from Spotify is under way.
+    pub soloist_downloading: bool,
+    /// How the last Soloist download ended, for Settings to say.
+    pub soloist_downloaded: Option<Result<crate::soloist::Downloaded, String>>,
     /// The listener closed the audio-key banner, and no song has played
     /// here since: further refusals only toast.
     audio_key_banner_closed: bool,
@@ -1261,6 +1270,10 @@ impl App {
             premium_notice_shown: false,
             slow_banner: false,
             audio_key_banner: false,
+            soloist_install: None,
+            soloist_inspected: false,
+            soloist_downloading: false,
+            soloist_downloaded: None,
             audio_key_banner_closed: false,
             shared_rate_limits_seen: 0,
             shared_rate_limited_at: None,
@@ -2475,6 +2488,9 @@ impl App {
                 continue;
             }
             match event {
+                Event::SoloistSignedIn => self.soloist_inspected = false,
+                Event::SoloistInstall(install) => self.soloist_install = Some(install),
+                Event::SoloistDownloaded(result) => self.soloist_downloaded(result),
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -11947,6 +11963,17 @@ impl App {
                     self.apply(Action::RestartEngine, ctx);
                 }
             }
+            Action::PlayThroughSoloist => self.play_through_soloist(ctx),
+            Action::DownloadSoloist => self.download_soloist(),
+            Action::SetUpSoloist => {
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new(crate::ui::settings::SETTINGS_FILTER_ID),
+                        "Soloist".to_string(),
+                    );
+                });
+                self.open(Page::Settings);
+            }
             Action::RestartEngine => {
                 self.save_settings();
                 let config = engine_config(
@@ -12373,6 +12400,84 @@ impl App {
         }
     }
 
+    /// Whether Soloist is found, has its key, is paired with this account
+    /// and has not expired, so it can play the moment it is turned on.
+    pub fn soloist_ready(&self) -> bool {
+        let Some(install) = self.soloist_install.as_ref() else {
+            return false;
+        };
+        matches!(
+            crate::soloist::readiness(&crate::soloist::Facts {
+                install: Some(install),
+                key_saved: install.key_saved,
+                account: self.user_id(),
+                signed_out: false,
+                now: jiff::Timestamp::now(),
+            }),
+            crate::soloist::Readiness::Ready | crate::soloist::Readiness::ExpiringSoon { .. }
+        )
+    }
+
+    /// Turns Soloist on and plays the song Spotify refused librespot through
+    /// it, where it is in its context. The request waits for the restarted
+    /// engine, as any play does while local playback connects.
+    fn play_through_soloist(&mut self, ctx: &egui::Context) {
+        let song = self
+            .intent_track
+            .as_ref()
+            .map(|intent| intent.uri.clone())
+            .or_else(|| self.local.track.as_ref().map(|track| track.uri.clone()));
+        self.settings.soloist = crate::settings::SoloistUse::Always;
+        self.audio_key_banner = false;
+        if let Some(song) = song {
+            let context = self.playing_context_uri();
+            self.queued_play = Some(PlayRequest {
+                uris: if context.is_none() {
+                    vec![song.clone()]
+                } else {
+                    Vec::new()
+                },
+                offset_uri: context.is_some().then_some(song),
+                context_uri: context,
+                offset_position: None,
+                position_ms: 0,
+            });
+        }
+        self.apply(Action::RestartEngine, ctx);
+    }
+
+    /// Asks the backend about Soloist once, and again after pairing or a
+    /// download, while Settings shows it.
+    fn inspect_soloist(&mut self) {
+        if !self.soloist_inspected {
+            self.soloist_inspected = true;
+            self.backend.send(Command::InspectSoloist);
+        }
+    }
+
+    /// Downloads Spotify's newest Soloist build, at the listener's request.
+    fn download_soloist(&mut self) {
+        if !self.soloist_downloading {
+            self.soloist_downloading = true;
+            self.soloist_downloaded = None;
+            self.backend.send(Command::DownloadSoloist);
+        }
+    }
+
+    /// A new build plays from Soloist's next start. One that could not
+    /// start, missing or expired, is started again now.
+    fn soloist_downloaded(&mut self, result: Result<crate::soloist::Downloaded, String>) {
+        self.soloist_downloading = false;
+        self.soloist_inspected = false;
+        if result.as_ref().is_ok_and(|downloaded| downloaded.new)
+            && self.settings.soloist == crate::settings::SoloistUse::Always
+            && self.local.error.is_some()
+        {
+            self.actions.push(Action::RestartEngine);
+        }
+        self.soloist_downloaded = Some(result);
+    }
+
     pub fn toast(&mut self, message: impl Into<String>) {
         self.toasts.push(Toast {
             message: message.into(),
@@ -12637,6 +12742,10 @@ impl App {
         self.handle_notch_commands();
         self.tick(ctx);
         self.note_listening();
+        // The audio-key banner offers Soloist once it is ready to play.
+        if self.page() == &Page::Settings || self.audio_key_banner {
+            self.inspect_soloist();
+        }
         // MilkDrop runs in a child process and can outlive the main window.
         // Poll it before applying actions because its keys produce actions.
         #[cfg(feature = "milkdrop")]
@@ -13426,15 +13535,15 @@ pub fn engine_config(
         audio_cache_limit: Some(settings.audio_cache_mb.max(64) * 1024 * 1024),
         proxy,
         local_files: settings.local_files_folder(),
-        soloist: (settings.playback_engine == crate::settings::PlaybackEngine::Soloist).then(
-            || crate::soloist::SoloistConfig {
-                binary: settings.soloist_path.clone(),
+        soloist: (settings.soloist == crate::settings::SoloistUse::Always).then(|| {
+            crate::soloist::SoloistConfig {
+                programs: dirs.soloist_programs_dir(),
                 key_file: dirs.soloist_key_file(),
                 data_dir: dirs.soloist_data_dir(),
                 cache_dir: settings.audio_cache.then(|| dirs.soloist_cache_dir()),
                 cache_mb: settings.audio_cache.then_some(settings.audio_cache_mb),
-            },
-        ),
+            }
+        }),
     }
 }
 

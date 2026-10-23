@@ -1374,6 +1374,13 @@ pub enum Action {
         playlist_order: Option<Vec<String>>,
     },
     RestartEngine,
+    /// Turn Spotify Soloist on and play the song librespot was refused
+    /// through it.
+    PlayThroughSoloist,
+    /// Open Settings at the Spotify Soloist section.
+    SetUpSoloist,
+    /// Download Spotify's newest Soloist build from Spotify's servers.
+    DownloadSoloist,
     /// Rebuild the HTTP client with the proxy in settings. Local playback
     /// restarts only when its HTTP proxy changed.
     ApplyProxy,

@@ -3488,6 +3488,58 @@ mod tests {
         }
     }
 
+    /// The audio-key banner offers to set Soloist up, and once Soloist is
+    /// ready, to play the refused song through it, which turns Soloist on.
+    #[test]
+    fn audio_key_banner_offers_soloist() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+
+        let (ctx, mut app) = accessible_app("audio-key-banner-soloist");
+        app.audio_key_banner = true;
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let set_up = accessible_node(&tree, "Set up Soloist", Role::Button);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(set_up, AccessibleAction::Click, None)],
+        );
+        assert!(matches!(app.page(), crate::model::Page::Settings));
+        assert_eq!(
+            ctx.data(|data| data.get_temp::<String>(egui::Id::new("settings-filter"))),
+            Some("Soloist".to_string())
+        );
+
+        app.soloist_install = Some(crate::soloist::Install {
+            binary: Some("/opt/soloist/soloist".into()),
+            overridden: false,
+            build: Some(crate::soloist::Build {
+                version: "1.3.10.12".into(),
+                built: jiff::Timestamp::now(),
+            }),
+            accounts: vec![app.user_id().unwrap_or("someone").to_string()],
+            key_saved: true,
+        });
+        app.audio_key_banner = true;
+        assert!(
+            app.soloist_ready(),
+            "a found, keyed, paired, current Soloist"
+        );
+        // Banners stay off the Settings page.
+        app.open(crate::model::Page::Home);
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let play = accessible_node(&tree, "Play through Soloist", Role::Button);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(play, AccessibleAction::Click, None)],
+        );
+        assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
+        assert!(!app.audio_key_banner);
+        app.backend.shutdown();
+    }
+
     #[test]
     fn audio_key_banner_opens_the_device_picker_or_closes() {
         use egui::accesskit::{Action as AccessibleAction, Role};
@@ -6124,6 +6176,191 @@ mod tests {
             .1;
         assert_eq!(node.value(), Some("local"), "read out as shown");
         app.backend.shutdown();
+    }
+
+    /// While Spotify Soloist plays, librespot's own settings are greyed out
+    /// with the reason, and a click leaves their value as it was.
+    #[test]
+    fn librespot_settings_are_greyed_out_while_soloist_plays() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+        let (ctx, mut app) = accessible_app("soloist-greys-librespot");
+        app.open(Page::Settings);
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        let normalisation = app.settings.normalisation;
+        let shows = |tree: &egui::accesskit::TreeUpdate, text: &str| {
+            tree.nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some(text) || node.value() == Some(text))
+        };
+        let filter = |text: &str| {
+            ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("settings-filter"), text.to_string())
+            })
+        };
+        filter("Normalize");
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(shows(
+            &tree,
+            "Keep loud and quiet tracks at a similar level. Not used while Spotify Soloist plays."
+        ));
+        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|(id, node)| *id == switch && node.is_disabled()),
+            "greyed out"
+        );
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(switch, AccessibleAction::Click, None)],
+        );
+        assert_eq!(app.settings.normalisation, normalisation, "the value stays");
+
+        filter("Equalizer");
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(shows(
+            &tree,
+            "Not used while Spotify Soloist plays: it plays the audio itself, so Spotifast cannot shape or show it."
+        ));
+
+        // With librespot playing again, the row is as it always was.
+        app.settings.soloist = crate::settings::SoloistUse::Off;
+        filter("Normalize");
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(shows(
+            &tree,
+            "Keep loud and quiet tracks at a similar level."
+        ));
+        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(switch, AccessibleAction::Click, None)],
+        );
+        assert_eq!(app.settings.normalisation, !normalisation);
+        app.backend.shutdown();
+    }
+
+    /// The Spotify Soloist section names the next missing step and the
+    /// build's version and expiry, and says how to pair it.
+    #[test]
+    fn soloist_section_shows_the_build_and_how_to_pair() {
+        let (ctx, mut app) = accessible_app("soloist-section");
+        app.backend.shutdown();
+        let built = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(24 * 80))
+            .unwrap();
+        app.soloist_install = Some(crate::soloist::Install {
+            binary: Some("/opt/soloist/soloist".into()),
+            overridden: false,
+            build: Some(crate::soloist::Build {
+                version: "1.3.10.12".into(),
+                built,
+            }),
+            accounts: Vec::new(),
+            key_saved: true,
+        });
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("settings-filter"), "Soloist".to_string());
+            data.insert_temp(egui::Id::new("soloist-key-saved"), true);
+        });
+        for _ in 0..3 {
+            view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        }
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        // Not paired yet, so the switch asks for the steps below.
+        sidebar_text(
+            &painted,
+            "Play through Spotify's own player when Spotify refuses librespot songs. Finish the steps below first.",
+        );
+        assert!(
+            painted.iter().any(|(text, _)| {
+                text.starts_with("1.3.10.12 · stops working ")
+                    && (text.ends_with("(9 days left)") || text.ends_with("(10 days left)"))
+            }),
+            "the version, with the expiry counting down the 90 days"
+        );
+        sidebar_text(&painted, "Saved, readable only by you.");
+        // Pairing is a pick in Spotify's app, once Soloist runs.
+        sidebar_text(
+            &painted,
+            "Turn on Use Soloist, then choose Spotifast (soloist) in the Spotify app on your phone. Needed once.",
+        );
+        for gone in ["Status", "Version", "Expires", "Connect name"] {
+            assert!(
+                !painted.iter().any(|(text, _)| text.starts_with(gone)),
+                "{gone} is folded into the other rows"
+            );
+        }
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        sidebar_text(
+            &painted,
+            "In the Spotify app on your phone, on the same Wi-Fi, choose Spotifast (soloist). Needed once.",
+        );
+    }
+
+    /// Soloist is downloaded from Spotify when the listener asks, never
+    /// before, and Settings says how the download went.
+    #[test]
+    fn soloist_downloads_from_spotify_on_request() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+        if crate::soloist::ARCHIVE.is_none() {
+            return;
+        }
+        let (ctx, mut app) = accessible_app("soloist-download");
+        app.backend.shutdown();
+        app.soloist_install = Some(crate::soloist::Install::default());
+        app.soloist_inspected = true;
+        app.open(crate::model::Page::Settings);
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("settings-filter"), "Soloist".to_string());
+        });
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(!app.soloist_downloading, "nothing is fetched unasked");
+        let download = accessible_node(&tree, "Download from Spotify", Role::Button);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(download, AccessibleAction::Click, None)],
+        );
+        assert!(app.soloist_downloading);
+
+        // Answered, and read again: the new build is in place.
+        let build = crate::soloist::Build {
+            version: "1.3.10.13".into(),
+            built: jiff::Timestamp::now(),
+        };
+        app.soloist_downloading = false;
+        app.soloist_downloaded = Some(Ok(crate::soloist::Downloaded {
+            build: build.clone(),
+            new: true,
+        }));
+        app.soloist_install = Some(crate::soloist::Install {
+            binary: Some("/data/soloist-programs/1/soloist".into()),
+            build: Some(build),
+            ..Default::default()
+        });
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        assert!(
+            painted.iter().any(|(text, _)| {
+                text.starts_with("1.3.10.13 · stops working ")
+                    && text.ends_with(". Playback uses it from its next restart.")
+            }),
+            "the new build, and when it takes over"
+        );
+        app.soloist_downloaded = Some(Err("unable to download Soloist: timed out".into()));
+        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
+        sidebar_text(
+            &painted,
+            "The download failed: unable to download Soloist: timed out",
+        );
     }
 
     /// Settings offers Off, the window and the tray for a start at login,

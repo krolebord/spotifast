@@ -257,13 +257,20 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
         app.actions.push(Action::ListOutputDevices);
     }
     let listed = app.output_devices.get().map_or(&[][..], Vec::as_slice);
-    let current_name = current
-        .as_deref()
-        .map(|saved| saved_output_name(saved, listed).to_string());
+    // Soloist plays to the system's output itself; the choice waits for
+    // librespot.
+    let soloist_plays = app.settings.soloist == crate::settings::SoloistUse::Always;
+    let current_name = if soloist_plays {
+        Some(gettext(locale, "Spotify Soloist plays to the system's audio output").into_owned())
+    } else {
+        current
+            .as_deref()
+            .map(|saved| saved_output_name(saved, listed).to_string())
+    };
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
     response
         .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.as_ref()));
-    if response.hovered() {
+    if response.hovered() && !soloist_plays {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
     }
@@ -291,6 +298,9 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
         theme::regular(12.0),
         palette.secondary,
     );
+    if soloist_plays {
+        return;
+    }
     if open {
         Icon::ChevronUp
     } else {

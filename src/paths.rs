@@ -170,6 +170,11 @@ impl AppDirs {
         self.state.join("soloist")
     }
 
+    /// Spotify Soloist builds downloaded from Spotify, one folder per build.
+    pub fn soloist_programs_dir(&self) -> PathBuf {
+        self.state.join("soloist-programs")
+    }
+
     pub fn soloist_cache_dir(&self) -> PathBuf {
         self.cache.join("soloist")
     }
