@@ -377,13 +377,12 @@ const PAIRING_PATIENCE: f64 = 30.0;
 enum SoloistStep {
     Program,
     Key,
-    Pair,
 }
 
 /// The Spotify Soloist section: the switch, whose description says what
-/// Soloist is doing or needs next, then its program, its key and, until it
-/// is paired with this account, its pairing. The button of the row that
-/// needs the listener next is the primary one.
+/// Soloist is doing or needs next (pairing included, while Soloist waits
+/// for it), then its program and its key. The button of the row that needs
+/// the listener next is the primary one.
 fn soloist_section(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -393,7 +392,7 @@ fn soloist_section(
     any_visible: &mut bool,
 ) {
     use crate::settings::SoloistUse;
-    use crate::soloist::{Paired, Readiness, Status};
+    use crate::soloist::{Readiness, Status};
     let palette = app.palette;
     let locale = app.locale;
     let title = gettext(locale, "Spotify Soloist");
@@ -420,9 +419,6 @@ fn soloist_section(
         signed_out: status == Status::WaitingForPairing,
         now,
     });
-    let paired = install
-        .as_ref()
-        .map(|install| crate::soloist::paired(install, account.as_deref()));
     let device_name = crate::player::soloist_device_name(&app.settings.device_name);
     let found = install.as_ref().and_then(|install| install.binary.clone());
     let build = install.as_ref().and_then(|install| install.build.clone());
@@ -463,7 +459,6 @@ fn soloist_section(
         Readiness::NotFound | Readiness::ExpiringSoon { .. } => Some(SoloistStep::Program),
         Readiness::NeedsKey => Some(SoloistStep::Key),
         _ if key_suspect => Some(SoloistStep::Key),
-        Readiness::NeedsPairing | Readiness::OtherAccount => Some(SoloistStep::Pair),
         _ => None,
     };
 
@@ -488,12 +483,23 @@ fn soloist_section(
         .into_owned(),
         (Status::Failed(error), _) => error.clone(),
         (Status::Starting, _) => gettext(locale, "Starting…").into_owned(),
-        (Status::WaitingForPairing, _) => {
-            gettext(locale, "Waiting to be picked on your phone.").into_owned()
-        }
-        (_, Readiness::OtherAccount) => {
-            gettext(locale, "Paired with another account.").into_owned()
-        }
+        (Status::WaitingForPairing, _) if stuck => gettext(
+            locale,
+            "Not showing up on your phone? Check it's on the same Wi-Fi, or restart Soloist.",
+        )
+        .into_owned(),
+        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+        (Status::WaitingForPairing, _) => gettext(
+            locale,
+            "Waiting to be picked: choose {name} in the Spotify app on your phone, on the same Wi-Fi.",
+        )
+        .replace("{name}", &device_name),
+        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+        (status, Readiness::OtherAccount) if *status != Status::Off => gettext(
+            locale,
+            "Paired with another account. Choose {name} in the Spotify app while signed in to this one.",
+        )
+        .replace("{name}", &device_name),
         (Status::NoPlayback, _) => {
             gettext(locale, "Plays once local playback is set up.").into_owned()
         }
@@ -568,46 +574,19 @@ fn soloist_section(
     } else {
         gettext(locale, "From the Spotify for Developers dashboard.")
     };
-    let pairing_detail = match paired {
-        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        Some(Paired::OtherAccount) => gettext(
-            locale,
-            "Choose {name} in the Spotify app while signed in to this account.",
-        )
-        .replace("{name}", &device_name),
-        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        Some(Paired::ThisAccount) if status != Status::WaitingForPairing => {
-            gettext(locale, "Paired as {name}.").replace("{name}", &device_name)
-        }
-        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        _ => gettext(
-            locale,
-            "Choose {name} in the Spotify app on your phone, on the same Wi-Fi.",
-        )
-        .replace("{name}", &device_name),
-    };
-    let pairing_detail = if stuck {
-        format!(
-            "{pairing_detail} {}",
-            gettext(locale, "Not showing up? Restart Soloist.")
-        )
-    } else {
-        pairing_detail
-    };
     // Not there yet: the row is the download, with nothing to say.
     let program_title = if found.is_none() && !override_missing {
         gettext(locale, "Download")
     } else {
         gettext(locale, "Program")
     };
-    // Paired with this account, the row has nothing to say; it comes back
-    // when pairing needs the listener. Its words still find the section.
-    let pairing_shown = paired != Some(Paired::ThisAccount) || next == Some(SoloistStep::Pair);
     let rows = [
         RowText::new(gettext(locale, "Use Soloist"), use_detail),
         RowText::new(program_title, program_detail).when(!unavailable),
         RowText::new(gettext(locale, "API key"), key_detail).when(!unavailable),
-        RowText::new(gettext(locale, "Pairing"), pairing_detail).when(!unavailable),
+        // Pairing is told on the switch, while Soloist waits for it; a
+        // search for it finds the switch.
+        RowText::new(gettext(locale, "Pairing"), "").when(!unavailable),
     ];
     if !section_matches(needle, &title, &rows) {
         return;
@@ -626,9 +605,7 @@ fn soloist_section(
     };
     // Turning it on needs Soloist and its key; turning it off never waits.
     let switchable = on || (found.is_some() && !expired && key_saved);
-    // A search that finds the hidden Pairing row shows the switch, whose
-    // description says how Soloist is doing.
-    let use_needle = if !pairing_shown && rows[3].matches(&needle.trim().to_lowercase(), &title) {
+    let use_needle = if rows[3].matches(&needle.trim().to_lowercase(), &title) {
         ""
     } else {
         needle
@@ -658,6 +635,19 @@ fn soloist_section(
                 && theme::soft_button(ui, &palette, None, &gettext(locale, "Try again"), false)
                     .clicked()
             {
+                app.actions.push(Action::RestartSoloist);
+            }
+            if stuck
+                && theme::soft_button(
+                    ui,
+                    &palette,
+                    None,
+                    &gettext(locale, "Restart Soloist"),
+                    false,
+                )
+                .clicked()
+            {
+                ui.data_mut(|data| data.remove::<f64>(waiting_id));
                 app.actions.push(Action::RestartSoloist);
             }
         });
@@ -704,23 +694,6 @@ fn soloist_section(
         filtered_row(ui, &palette, needle, &title, &rows[2], |ui| {
             soloist_key_controls(app, ui, key_saved && !key_suspect, key_next);
         });
-        if pairing_shown {
-            filtered_row(ui, &palette, needle, &title, &rows[3], |ui| {
-                if stuck
-                    && theme::soft_button(
-                        ui,
-                        &palette,
-                        None,
-                        &gettext(locale, "Restart Soloist"),
-                        false,
-                    )
-                    .clicked()
-                {
-                    ui.data_mut(|data| data.remove::<f64>(waiting_id));
-                    app.actions.push(Action::RestartSoloist);
-                }
-            });
-        }
     });
 }
 

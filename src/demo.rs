@@ -6328,10 +6328,9 @@ mod tests {
         );
         sidebar_text(&painted, "From the Spotify for Developers dashboard.");
         sidebar_text(&painted, "Save key");
-        // The same words whether Soloist is on or off.
-        sidebar_text(
-            &painted,
-            "Choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi.",
+        assert!(
+            !painted_has(&painted, "Pairing"),
+            "nothing to pair before Soloist runs"
         );
 
         app.soloist_install = Some(soloist_install(10, &[], true));
@@ -6359,11 +6358,11 @@ mod tests {
                 .into(),
         );
         let painted = soloist_painted(&ctx, &mut app);
-        sidebar_text(&painted, "Waiting to be picked on your phone.");
         sidebar_text(
             &painted,
-            "Choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi.",
+            "Waiting to be picked: choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi.",
         );
+        assert!(!painted_has(&painted, "Pairing"), "told on the switch");
         assert!(
             !painted_has(&painted, "Restart Soloist"),
             "discovery gets its time first"
@@ -6374,15 +6373,14 @@ mod tests {
         sidebar_text(&painted, "Restart Soloist");
         sidebar_text(
             &painted,
-            "Choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi. Not showing up? Restart Soloist.",
+            "Not showing up on your phone? Check it's on the same Wi-Fi, or restart Soloist.",
         );
     }
 
-    /// Paired with this account, the Pairing row goes; it comes back when
-    /// pairing needs the listener, and a search for it still finds the
-    /// section.
+    /// Pairing has no row: the switch tells it while it is wanted, and a
+    /// search for it finds the switch.
     #[test]
-    fn soloist_hides_pairing_once_paired_with_this_account() {
+    fn soloist_tells_pairing_on_its_switch() {
         let (ctx, mut app) = accessible_app("soloist-paired");
         app.backend.shutdown();
         let me = app.user_id().unwrap_or("someone").to_string();
@@ -6398,19 +6396,25 @@ mod tests {
         sidebar_text(&painted, "Check for an update");
         assert!(!painted_has(&painted, "Pairing"));
         ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "paired".to_string());
+            data.insert_temp(egui::Id::new("settings-filter"), "pair".to_string());
         });
         let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
         sidebar_text(&painted, "Use Soloist");
 
-        // Signed in to someone else: the row is back, and says what to do.
+        // Signed in to someone else: the switch says what to do.
         app.soloist_install = Some(soloist_install(10, &["someone-else"], true));
         let painted = soloist_painted(&ctx, &mut app);
-        sidebar_text(&painted, "Paired with another account.");
-        sidebar_text(&painted, "Pairing");
         sidebar_text(
             &painted,
-            "Choose Spotifast (soloist) in the Spotify app while signed in to this account.",
+            "Paired with another account. Choose Spotifast (soloist) in the Spotify app while signed in to this one.",
+        );
+        assert!(!painted_has(&painted, "Pairing"));
+        // Off, it is not news.
+        app.settings.soloist = crate::settings::SoloistUse::Off;
+        let painted = soloist_painted(&ctx, &mut app);
+        sidebar_text(
+            &painted,
+            "Play through Spotify's own player when Spotify refuses librespot songs.",
         );
     }
 
