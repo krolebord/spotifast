@@ -48,9 +48,9 @@ struct RowText<'a> {
     title: std::borrow::Cow<'a, str>,
     description: std::borrow::Cow<'a, str>,
     available: bool,
-    /// Its control can be used; a setting Spotify Soloist ignores is shown
-    /// greyed out while Soloist plays.
-    enabled: bool,
+    /// Why its control is greyed out, shown on hover: a setting Spotify
+    /// Soloist ignores while Soloist plays. `None` when it can be used.
+    disabled: Option<std::borrow::Cow<'a, str>>,
 }
 
 impl<'a> RowText<'a> {
@@ -62,7 +62,7 @@ impl<'a> RowText<'a> {
             title: title.into(),
             description: description.into(),
             available: true,
-            enabled: true,
+            disabled: None,
         }
     }
 
@@ -72,19 +72,11 @@ impl<'a> RowText<'a> {
     }
 
     /// A setting of librespot's player: while Spotify Soloist plays, its
-    /// control is greyed out and its description says why. Its value stays
+    /// control is greyed out and hovering the row says why. Its value stays
     /// for when librespot plays again.
     fn librespot_only(mut self, locale: crate::i18n::Locale, soloist_plays: bool) -> Self {
         if soloist_plays {
-            self.enabled = false;
-            self.description = format!(
-                "{} {}",
-                self.description,
-                gettext(locale, "Not used while Spotify Soloist plays.")
-            )
-            .trim_start()
-            .to_string()
-            .into();
+            self.disabled = Some(gettext(locale, "Not used while Spotify Soloist plays."));
         }
         self
     }
@@ -182,11 +174,7 @@ fn filtered_row(
     row: &RowText<'_>,
     control: impl FnOnce(&mut egui::Ui),
 ) {
-    if row.matches(needle, section) {
-        widgets::setting_row(ui, palette, &row.title, &row.description, |ui| {
-            ui.add_enabled_ui(row.enabled, control);
-        });
-    }
+    filtered_row_sized(ui, palette, needle, section, row, 0.0, control);
 }
 
 /// `filtered_row` for a control that needs `control_width` points.
@@ -199,7 +187,10 @@ fn filtered_row_sized(
     control_width: f32,
     control: impl FnOnce(&mut egui::Ui),
 ) {
-    if row.matches(needle, section) {
+    if !row.matches(needle, section) {
+        return;
+    }
+    let draw = |ui: &mut egui::Ui| {
         widgets::setting_row_sized(
             ui,
             palette,
@@ -207,9 +198,16 @@ fn filtered_row_sized(
             &row.description,
             control_width,
             |ui| {
-                ui.add_enabled_ui(row.enabled, control);
+                ui.add_enabled_ui(row.disabled.is_none(), control);
             },
         );
+    };
+    match &row.disabled {
+        // The whole row, text and control, says why on hover.
+        Some(reason) => {
+            ui.scope(draw).response.on_hover_text(reason.as_ref());
+        }
+        None => draw(ui),
     }
 }
 
