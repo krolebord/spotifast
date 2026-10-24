@@ -710,6 +710,13 @@ pub enum Command {
     DownloadSoloist {
         asked: bool,
     },
+    /// Save the Soloist API key, or remove it with `None`, off the UI
+    /// thread, then read Soloist again and restart it if it plays.
+    SoloistKey(Option<crate::soloist::ApiKey>),
+    /// Stop the running Soloist and start the engine again, so a new build
+    /// or key takes over: a plain restart adopts the Soloist that runs.
+    /// `None` keeps the engine's configuration.
+    RestartSoloist(Option<EngineConfig>),
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
     /// ask the person first.
@@ -2238,6 +2245,46 @@ impl Worker {
                         let _ = events.send(Event::SoloistDownloaded { asked, result });
                         waker.wake();
                     });
+                }
+                Command::SoloistKey(key) => {
+                    let programs = self.dirs.soloist_programs_dir();
+                    let data_dir = self.dirs.soloist_data_dir();
+                    let key_file = self.dirs.soloist_key_file();
+                    let events = self.events.clone();
+                    let commands = self.commands.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let written = match &key {
+                            Some(key) => fastframe_file::write_private(&key_file, key.0.as_bytes()),
+                            None => match std::fs::remove_file(&key_file) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    Ok(())
+                                }
+                                result => result,
+                            },
+                        };
+                        drop(key);
+                        if let Err(error) = written {
+                            log::error!("unable to change the Soloist API key: {error}");
+                            let _ = events.send(Event::Error(format!(
+                                "Couldn't change the Soloist API key: {error}"
+                            )));
+                        }
+                        let install = crate::soloist::inspect(&programs, &data_dir, &key_file);
+                        let _ = events.send(Event::SoloistInstall(install));
+                        let _ = commands.send(Command::RestartSoloist(None));
+                        waker.wake();
+                    });
+                }
+                Command::RestartSoloist(config) => {
+                    if let Some(mut config) = config {
+                        config.proxy = self.engine_config.proxy.clone();
+                        self.engine_config = config;
+                    }
+                    if self.engine_config.soloist.is_some() {
+                        crate::soloist::stop_slot(&self.soloist);
+                        self.replace_engine();
+                    }
                 }
                 Command::OpenThemesFolder => {
                     let directory = self.dirs.config.join("themes");
@@ -8460,6 +8507,44 @@ mod authorization_tests {
             event, Event::Api(response) if matches!(response.as_ref(),
                 ApiResponse::MadeForYou { top_mixes: Ok(mixes), .. } if mixes.len() == 1)
         )));
+    }
+
+    /// The Soloist API key is written, private, and removed by the
+    /// backend, which then reads Soloist again so Settings shows it.
+    #[test]
+    fn the_soloist_key_is_saved_and_removed_by_the_backend() {
+        let (runtime, mut worker, events) = worker("soloist-key");
+        let key_file = worker.dirs.soloist_key_file();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let next_install = |events: &std::sync::mpsc::Receiver<Event>| loop {
+            match events.recv_timeout(Duration::from_secs(5)) {
+                Ok(Event::SoloistInstall(install)) => break install,
+                Ok(_) => continue,
+                Err(error) => panic!("no Soloist reading: {error}"),
+            }
+        };
+        commands
+            .send(Command::SoloistKey(Some(crate::soloist::ApiKey(
+                "0123abcd".into(),
+            ))))
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(next_install(&events).key_saved);
+        assert_eq!(std::fs::read_to_string(&key_file).unwrap(), "0123abcd");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "readable only by its owner");
+        }
+
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(Command::SoloistKey(None)).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!next_install(&events).key_saved);
+        assert!(!key_file.exists());
     }
 
     pub(super) fn worker(

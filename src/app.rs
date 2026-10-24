@@ -693,6 +693,10 @@ pub struct App {
     pub soloist_downloading: bool,
     /// How the last Soloist download ended, for Settings to say.
     pub soloist_downloaded: Option<Result<crate::soloist::Downloaded, String>>,
+    /// Soloist was restarted and the engine has not answered yet.
+    pub soloist_starting: bool,
+    /// A new build arrived while Soloist played; it takes over on a restart.
+    pub soloist_build_waiting: bool,
     /// When Soloist last asked the backend whether its daily check is due.
     soloist_checked: Option<Instant>,
     /// The listener closed the audio-key banner, and no song has played
@@ -1276,6 +1280,8 @@ impl App {
             soloist_inspected: false,
             soloist_downloading: false,
             soloist_downloaded: None,
+            soloist_starting: false,
+            soloist_build_waiting: false,
             soloist_checked: None,
             audio_key_banner_closed: false,
             shared_rate_limits_seen: 0,
@@ -2827,6 +2833,9 @@ impl App {
 
     /// Retries the Home shelf when local playback becomes ready after Home.
     fn handle_playback(&mut self, status: LocalPlayback) {
+        if !matches!(status, LocalPlayback::Connecting) {
+            self.soloist_starting = false;
+        }
         match &status {
             LocalPlayback::Ready { device_id } => {
                 self.local_device_id = Some(device_id.clone());
@@ -11970,6 +11979,27 @@ impl App {
             }
             Action::PlayThroughSoloist => self.play_through_soloist(ctx),
             Action::DownloadSoloist => self.download_soloist(),
+            Action::SaveSoloistKey(key) => {
+                // Shown at once; the backend's reading confirms it.
+                if let Some(install) = self.soloist_install.as_mut() {
+                    install.key_saved = key.is_some();
+                }
+                self.soloist_starting |= self.soloist_restarts();
+                self.backend.send(Command::SoloistKey(key));
+            }
+            Action::RestartSoloist => {
+                self.save_settings();
+                let config = engine_config(
+                    &self.dirs,
+                    &self.settings,
+                    self.applied_proxy.clone(),
+                    std::sync::Arc::clone(&self.winamp.tap),
+                    std::sync::Arc::clone(&self.winamp.eq),
+                );
+                self.soloist_build_waiting = false;
+                self.soloist_starting |= self.soloist_restarts();
+                self.backend.send(Command::RestartSoloist(Some(config)));
+            }
             Action::SetUpSoloist => {
                 ctx.data_mut(|data| {
                     data.insert_temp(
@@ -11989,6 +12019,10 @@ impl App {
                     std::sync::Arc::clone(&self.winamp.eq),
                 );
                 self.backend.send(Command::RestartEngine(config));
+                if self.settings.soloist == crate::settings::SoloistUse::Off {
+                    self.soloist_build_waiting = false;
+                }
+                self.soloist_starting = self.soloist_restarts();
                 if self.local_ready {
                     self.toast(gettext(self.locale, "Restarting local playback"));
                 }
@@ -12451,6 +12485,13 @@ impl App {
         self.apply(Action::RestartEngine, ctx);
     }
 
+    /// Whether a restart now starts Soloist: it is on, and local playback
+    /// is set up for it to start in.
+    fn soloist_restarts(&self) -> bool {
+        self.settings.soloist == crate::settings::SoloistUse::Always
+            && !matches!(self.local_playback, LocalPlayback::Unavailable)
+    }
+
     /// Asks the backend about Soloist once, and again after pairing or a
     /// download, while Settings shows it.
     fn inspect_soloist(&mut self) {
@@ -12484,7 +12525,8 @@ impl App {
     }
 
     /// A new build plays from Soloist's next start. One that could not
-    /// start, missing or expired, is started again now. A check of its own
+    /// start, missing or expired, or waits to be paired, is started again
+    /// now; one that plays waits for the listener. A check of its own
     /// speaks only when it brought a new build.
     fn soloist_downloaded(
         &mut self,
@@ -12500,9 +12542,15 @@ impl App {
         self.soloist_inspected = false;
         if result.as_ref().is_ok_and(|downloaded| downloaded.new)
             && self.settings.soloist == crate::settings::SoloistUse::Always
-            && self.local.error.is_some()
         {
-            self.actions.push(Action::RestartEngine);
+            if self.local.error.is_some()
+                || !matches!(self.local_playback, LocalPlayback::Ready { .. })
+            {
+                // Not playing anything: the new build takes over now.
+                self.actions.push(Action::RestartSoloist);
+            } else {
+                self.soloist_build_waiting = true;
+            }
         }
         self.soloist_downloaded = Some(result);
     }

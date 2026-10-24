@@ -570,6 +570,68 @@ pub fn is_pairing_needed(error: &str) -> bool {
     error.starts_with(PAIRING_NEEDED)
 }
 
+/// Whether an engine error is Soloist exiting before it opened its API,
+/// which is how it answers a key Spotify does not accept.
+pub fn is_key_suspect(error: &str) -> bool {
+    error.starts_with(EXITED_STARTING)
+}
+
+/// What the Soloist that playback goes through is doing, as far as the
+/// interface knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Playback does not go through Soloist.
+    Off,
+    /// Local playback is not set up, so nothing starts.
+    NoPlayback,
+    Starting,
+    /// Running, without a session: it waits for a pick in Spotify's app.
+    WaitingForPairing,
+    Playing,
+    /// It did not start, or stopped; the engine's words.
+    Failed(String),
+}
+
+/// `on`: playback goes through Soloist. `starting`: a restart was asked
+/// for and the engine has not answered yet. `error`: local playback's
+/// error, Soloist's own while it plays.
+pub fn status(
+    on: bool,
+    starting: bool,
+    playback: &crate::backend::LocalPlayback,
+    error: Option<&str>,
+) -> Status {
+    use crate::backend::LocalPlayback;
+    if !on {
+        return Status::Off;
+    }
+    if starting {
+        return Status::Starting;
+    }
+    match playback {
+        LocalPlayback::Unavailable => Status::NoPlayback,
+        LocalPlayback::Authorizing
+        | LocalPlayback::Connecting
+        | LocalPlayback::WaitingForNetwork => Status::Starting,
+        LocalPlayback::Failed(message) => Status::Failed(message.clone()),
+        LocalPlayback::Ready { .. } => match error {
+            Some(error) if is_pairing_needed(error) => Status::WaitingForPairing,
+            Some(error) => Status::Failed(error.to_string()),
+            None => Status::Playing,
+        },
+    }
+}
+
+/// A Soloist API key on its way to its file, kept out of logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(pub String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ApiKey(..)")
+    }
+}
+
 /// A running Soloist and the connection to its local API.
 pub struct Soloist {
     commands: mpsc::UnboundedSender<Value>,
@@ -1049,6 +1111,8 @@ async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) 
 
 /// The start of the message shown while Soloist waits to be paired.
 const PAIRING_NEEDED: &str = "Soloist is waiting to be paired.";
+/// The start of the message shown when Soloist exits before it is ready.
+const EXITED_STARTING: &str = "Spotify Soloist exited while starting";
 
 fn pairing_needed(device_name: &str) -> String {
     format!(
@@ -1097,7 +1161,7 @@ async fn wait_for_port(child: &mut tokio::process::Child, port_file: &Path) -> R
                     "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
                 ),
                 code => anyhow!(
-                    "Spotify Soloist exited while starting (exit code {}). Check its API key; the log has details.",
+                    "{EXITED_STARTING} (exit code {}). Check its API key; the log has details.",
                     code.map_or_else(|| "none".into(), |code| code.to_string())
                 ),
             });
@@ -1592,6 +1656,54 @@ mod tests {
             readiness(&facts(Some(&unpaired), now)),
             Readiness::NeedsPairing
         );
+    }
+
+    /// Settings reads what Soloist is doing from local playback: its
+    /// error while it runs, the engine's while it does not.
+    #[test]
+    fn the_status_follows_local_playback() {
+        use crate::backend::LocalPlayback;
+        let ready = LocalPlayback::Ready {
+            device_id: "soloist".into(),
+        };
+        assert_eq!(status(false, true, &ready, None), Status::Off);
+        assert_eq!(status(true, true, &ready, None), Status::Starting);
+        assert_eq!(status(true, false, &ready, None), Status::Playing);
+        assert_eq!(
+            status(true, false, &LocalPlayback::Connecting, None),
+            Status::Starting
+        );
+        assert_eq!(
+            status(true, false, &LocalPlayback::Unavailable, None),
+            Status::NoPlayback
+        );
+        let pairing = pairing_needed("Spotifast (soloist)");
+        assert_eq!(
+            status(true, false, &ready, Some(&pairing)),
+            Status::WaitingForPairing
+        );
+        assert_eq!(
+            status(
+                true,
+                false,
+                &ready,
+                Some("Spotify Soloist stopped unexpectedly")
+            ),
+            Status::Failed("Spotify Soloist stopped unexpectedly".into())
+        );
+        let exited = format!("{EXITED_STARTING} (exit code 1). Check its API key.");
+        assert_eq!(
+            status(true, false, &LocalPlayback::Failed(exited.clone()), None),
+            Status::Failed(exited.clone())
+        );
+        assert!(is_key_suspect(&exited));
+        assert!(!is_key_suspect("Spotify Soloist stopped unexpectedly"));
+    }
+
+    #[test]
+    fn an_api_key_stays_out_of_debug_output() {
+        let key = ApiKey("0123456789abcdef".into());
+        assert_eq!(format!("{key:?}"), "ApiKey(..)");
     }
 
     #[test]

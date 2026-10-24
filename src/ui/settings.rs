@@ -14,20 +14,10 @@ use super::widgets;
 const PLAYBACK_DIRTY_ID: &str = "playback-settings-dirty";
 /// The Soloist API key being typed; in memory only until saved.
 const SOLOIST_KEY_INPUT_ID: &str = "soloist-key-input";
-const SOLOIST_KEY_SAVED_ID: &str = "soloist-key-saved";
-
-/// Whether the Soloist API key is saved, read once rather than every frame.
-fn soloist_key_saved(app: &App, ui: &egui::Ui) -> bool {
-    let saved_id = egui::Id::new(SOLOIST_KEY_SAVED_ID);
-    match ui.data(|data| data.get_temp::<bool>(saved_id)) {
-        Some(saved) => saved,
-        None => {
-            let saved = app.dirs.soloist_key_file().is_file();
-            ui.data_mut(|data| data.insert_temp(saved_id, saved));
-            saved
-        }
-    }
-}
+/// A saved Soloist API key is being replaced.
+const SOLOIST_KEY_EDITING_ID: &str = "soloist-key-editing";
+/// When Soloist began waiting to be picked in Spotify's app.
+const SOLOIST_WAITING_SINCE_ID: &str = "soloist-waiting-since";
 pub(crate) const PERSONAL_APP_FOCUS_ID: &str = "focus-personal-app-setup";
 pub(crate) const SETTINGS_FILTER_ID: &str = "settings-filter";
 
@@ -377,8 +367,23 @@ fn section(
     ui.add_space(8.0);
 }
 
-/// The Spotify Soloist section: when it plays, where it is, its build and
-/// expiry, its key and its pairing, with the next missing step on top.
+/// How long Soloist waits to be picked in Spotify's app before Settings
+/// offers to start it again, in seconds.
+const PAIRING_PATIENCE: f64 = 30.0;
+
+/// A Soloist row that can be the next thing the listener has to do; its
+/// button is the section's primary one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoloistStep {
+    Program,
+    Key,
+    Pair,
+}
+
+/// The Spotify Soloist section: the switch, whose description says what
+/// Soloist is doing or needs next, then its program, its key and, until it
+/// is paired with this account, its pairing. The button of the row that
+/// needs the listener next is the primary one.
 fn soloist_section(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -388,7 +393,7 @@ fn soloist_section(
     any_visible: &mut bool,
 ) {
     use crate::settings::SoloistUse;
-    use crate::soloist::{Paired, Readiness};
+    use crate::soloist::{Paired, Readiness, Status};
     let palette = app.palette;
     let locale = app.locale;
     let title = gettext(locale, "Spotify Soloist");
@@ -398,28 +403,29 @@ fn soloist_section(
     // not set by hand.
     let downloadable = crate::soloist::ARCHIVE.is_some() && !overridden;
     let downloading = app.soloist_downloading;
-    let key_saved = soloist_key_saved(app, ui);
+    let on = app.settings.soloist == SoloistUse::Always;
+    let status = crate::soloist::status(
+        on,
+        app.soloist_starting,
+        &app.local_playback,
+        app.local.error.as_deref(),
+    );
+    let key_saved = install.as_ref().is_some_and(|install| install.key_saved);
     let account = app.user_id().map(str::to_string);
-    let signed_out = app.settings.soloist == SoloistUse::Always
-        && app
-            .local
-            .error
-            .as_deref()
-            .is_some_and(crate::soloist::is_pairing_needed);
     let now = jiff::Timestamp::now();
     let readiness = crate::soloist::readiness(&crate::soloist::Facts {
         install: install.as_ref(),
         key_saved,
         account: account.as_deref(),
-        signed_out,
+        signed_out: status == Status::WaitingForPairing,
         now,
     });
+    let paired = install
+        .as_ref()
+        .map(|install| crate::soloist::paired(install, account.as_deref()));
     let device_name = crate::player::soloist_device_name(&app.settings.device_name);
     let found = install.as_ref().and_then(|install| install.binary.clone());
     let build = install.as_ref().and_then(|install| install.build.clone());
-    let days = build
-        .as_ref()
-        .map(|build| crate::soloist::days_left(build, now));
     let date = |at: jiff::Timestamp| {
         let day = at
             .to_zoned(jiff::tz::TimeZone::system())
@@ -427,164 +433,247 @@ fn soloist_section(
             .to_string();
         crate::util::format_date(locale, &day)
     };
-
     let unavailable = crate::soloist::ARCHIVE.is_none() && !overridden;
-    let use_detail = match readiness {
-        Readiness::NotFound if unavailable => gettext(
+    // `SPOTIFAST_SOLOIST` names a file that is not there.
+    let override_missing = overridden && found.is_none();
+    let expired = readiness == Readiness::Expired;
+    let key_suspect =
+        matches!(&status, Status::Failed(error) if crate::soloist::is_key_suspect(error));
+    let build_waiting = app.soloist_build_waiting && status == Status::Playing;
+
+    // How long Soloist has waited to be picked, for the offer to restart it.
+    let waiting_id = egui::Id::new(SOLOIST_WAITING_SINCE_ID);
+    let stuck = if status == Status::WaitingForPairing {
+        let time = ui.input(|input| input.time);
+        let since = ui.data_mut(|data| *data.get_temp_mut_or_insert_with(waiting_id, || time));
+        let waited = time - since;
+        if waited < PAIRING_PATIENCE {
+            ui.ctx()
+                .request_repaint_after_secs((PAIRING_PATIENCE - waited) as f32);
+        }
+        waited >= PAIRING_PATIENCE
+    } else {
+        ui.data_mut(|data| data.remove::<f64>(waiting_id));
+        false
+    };
+
+    // The row that needs the listener next.
+    let next = match readiness {
+        _ if override_missing || expired || build_waiting => Some(SoloistStep::Program),
+        Readiness::NotFound | Readiness::ExpiringSoon { .. } => Some(SoloistStep::Program),
+        Readiness::NeedsKey => Some(SoloistStep::Key),
+        _ if key_suspect => Some(SoloistStep::Key),
+        Readiness::NeedsPairing | Readiness::OtherAccount => Some(SoloistStep::Pair),
+        _ => None,
+    };
+
+    // What Soloist is doing, or what it needs next.
+    let use_detail = match (&status, &readiness) {
+        (_, Readiness::Checking) => gettext(locale, "Looking for Soloist…").into_owned(),
+        _ if unavailable => gettext(
             locale,
             "Spotify publishes no Soloist build for this computer.",
-        ),
-        Readiness::Checking | Readiness::Ready | Readiness::ExpiringSoon { .. } => gettext(
+        )
+        .into_owned(),
+        // Translators: {variable} is the name of an environment variable.
+        _ if override_missing => gettext(locale, "{variable} names a missing file.")
+            .replace("{variable}", crate::soloist::BINARY_ENV),
+        (_, Readiness::Expired) => gettext(locale, "This build has expired.").into_owned(),
+        (_, Readiness::NotFound) => gettext(locale, "Download Soloist first.").into_owned(),
+        (_, Readiness::NeedsKey) => gettext(locale, "Add your API key first.").into_owned(),
+        (Status::Failed(_), _) if key_suspect => gettext(
+            locale,
+            "Soloist didn't start. Spotify may have rejected the API key.",
+        )
+        .into_owned(),
+        (Status::Failed(error), _) => error.clone(),
+        (Status::Starting, _) => gettext(locale, "Starting…").into_owned(),
+        (Status::WaitingForPairing, _) => {
+            gettext(locale, "Waiting to be picked on your phone.").into_owned()
+        }
+        (_, Readiness::OtherAccount) => {
+            gettext(locale, "Paired with another account.").into_owned()
+        }
+        (Status::NoPlayback, _) => {
+            gettext(locale, "Plays once local playback is set up.").into_owned()
+        }
+        (Status::Off, _) => gettext(
             locale,
             "Play through Spotify's own player when Spotify refuses librespot songs.",
-        ),
-        _ => gettext(
-            locale,
-            "Play through Spotify's own player when Spotify refuses librespot songs. Finish the steps below first.",
-        ),
+        )
+        .into_owned(),
+        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+        _ => gettext(locale, "Playing as {name}.").replace("{name}", &device_name),
     };
-    let build_line = build.as_ref().map(|build| match days {
-        Some(days) if days >= 0 => ngettext(
-            locale,
-            // Translators: {version} is a version number, {date} a day, {count} the days until then.
-            "{version} · stops working {date} ({count} day left)",
-            "{version} · stops working {date} ({count} days left)",
-            days as u32,
-        )
-        .replace("{version}", &build.version)
-        .replace("{date}", &date(build.expires()))
-        .replace("{count}", &days.to_string()),
-        // Translators: {version} is a version number, {date} the day it stopped working.
-        _ => gettext(
-            locale,
-            "{version} · stopped working {date}. Update it from Spotify.",
-        )
-        .replace("{version}", &build.version)
-        .replace("{date}", &date(build.expires())),
+    // Starting it again can help once it failed with everything in place.
+    let try_again = matches!(status, Status::Failed(_)) && next != Some(SoloistStep::Program);
+
+    let build_line = build.as_ref().map(|build| {
+        let days = crate::soloist::days_left(build, now);
+        if days < 0 {
+            // Translators: {version} is a version number, {date} the day it stopped working.
+            gettext(locale, "{version} · expired {date}")
+                .replace("{version}", &build.version)
+                .replace("{date}", &date(build.expires()))
+        } else if days < crate::soloist::EXPIRY_WARNING_DAYS {
+            ngettext(
+                locale,
+                // Translators: {version} is a version number, {count} the days until it stops working.
+                "{version} · expires in {count} day",
+                "{version} · expires in {count} days",
+                days as u32,
+            )
+            .replace("{version}", &build.version)
+            .replace("{count}", &days.to_string())
+        } else {
+            // Translators: {version} is a version number, {date} the day it stops working.
+            gettext(locale, "{version} · expires {date}")
+                .replace("{version}", &build.version)
+                .replace("{date}", &date(build.expires()))
+        }
     });
     let program_detail = match (&app.soloist_downloaded, &found, build_line) {
-        _ if downloading => gettext(locale, "Downloading from Spotify…").into_owned(),
-        _ if install.is_none() => gettext(locale, "Looking for Spotify Soloist…").into_owned(),
+        _ if downloading => String::new(),
+        _ if override_missing => std::env::var_os(crate::soloist::BINARY_ENV)
+            .map(|path| std::path::PathBuf::from(path).display().to_string())
+            .unwrap_or_default(),
+        // Translators: {build} is the version and expiry line, {error} says why the download failed.
+        (Some(Err(error)), _, Some(line)) => gettext(locale, "{build} · download failed: {error}")
+            .replace("{build}", &line)
+            .replace("{error}", error),
         // Translators: {error} says why the download failed.
-        (Some(Err(error)), _, _) => {
-            gettext(locale, "The download failed: {error}").replace("{error}", error)
+        (Some(Err(error)), _, None) => {
+            gettext(locale, "Download failed: {error}").replace("{error}", error)
         }
-        // Translators: {build} is the version and expiry line before it.
-        (_, Some(_), Some(line)) if overridden => gettext(locale, "{build}, set by {variable}")
+        // Translators: {build} is the version and expiry line, {variable} an environment variable.
+        (_, Some(_), Some(line)) if overridden => gettext(locale, "{build} · from {variable}")
             .replace("{build}", &line)
             .replace("{variable}", crate::soloist::BINARY_ENV),
         // Translators: {build} is the version and expiry line before it.
-        (Some(Ok(downloaded)), Some(_), Some(line))
-            if downloaded.new && app.settings.soloist == SoloistUse::Always =>
-        {
-            gettext(locale, "{build}. Playback uses it from its next restart.")
-                .replace("{build}", &line)
+        (_, Some(_), Some(line)) if build_waiting => {
+            gettext(locale, "{build} · ready after a restart").replace("{build}", &line)
         }
         // Translators: {build} is the version and expiry line before it.
         (Some(Ok(downloaded)), Some(_), Some(line)) if !downloaded.new => {
-            gettext(locale, "{build}. Already Spotify's newest build.").replace("{build}", &line)
+            gettext(locale, "{build} · up to date").replace("{build}", &line)
         }
         (_, Some(_), Some(line)) => line,
-        (_, Some(_), None) => {
-            gettext(locale, "Soloist did not say which version it is.").into_owned()
-        }
-        _ if unavailable => gettext(
-            locale,
-            "Spotify publishes Soloist for Apple silicon Macs, Windows and Linux.",
-        )
-        .into_owned(),
-        _ => gettext(
-            locale,
-            "Not downloaded. It comes from Spotify's servers, under Spotify's terms.",
-        )
-        .into_owned(),
+        (_, Some(_), None) => gettext(locale, "Version unknown").into_owned(),
+        _ => String::new(),
     };
-    let paired = install
-        .as_ref()
-        .map(|install| crate::soloist::paired(install, account.as_deref()));
-    let pairing_detail = match (paired, signed_out) {
+    let key_detail = if key_suspect {
+        gettext(locale, "Spotify may have rejected it.")
+    } else if key_saved {
+        gettext(locale, "Saved.")
+    } else {
+        gettext(locale, "From the Spotify for Developers dashboard.")
+    };
+    let pairing_detail = match paired {
         // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        (Some(Paired::ThisAccount), false) => {
-            gettext(locale, "Paired with this account as {name}.").replace("{name}", &device_name)
+        Some(Paired::OtherAccount) => gettext(
+            locale,
+            "Choose {name} in the Spotify app while signed in to this account.",
+        )
+        .replace("{name}", &device_name),
+        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+        Some(Paired::ThisAccount) if status != Status::WaitingForPairing => {
+            gettext(locale, "Paired as {name}.").replace("{name}", &device_name)
         }
-        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        (Some(Paired::OtherAccount), _) => gettext(
-            locale,
-            "Paired with another account. Choose {name} in the Spotify app while signed in to this one.",
-        )
-        .replace("{name}", &device_name),
-        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-        _ if app.settings.soloist == SoloistUse::Always => gettext(
-            locale,
-            "In the Spotify app on your phone, on the same Wi-Fi, choose {name}. Needed once.",
-        )
-        .replace("{name}", &device_name),
         // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
         _ => gettext(
             locale,
-            "Turn on Use Soloist, then choose {name} in the Spotify app on your phone. Needed once.",
+            "Choose {name} in the Spotify app on your phone, on the same Wi-Fi.",
         )
         .replace("{name}", &device_name),
     };
+    let pairing_detail = if stuck {
+        format!(
+            "{pairing_detail} {}",
+            gettext(locale, "Not showing up? Restart Soloist.")
+        )
+    } else {
+        pairing_detail
+    };
+    // Not there yet: the row is the download, with nothing to say.
+    let program_title = if found.is_none() && !override_missing {
+        gettext(locale, "Download")
+    } else {
+        gettext(locale, "Program")
+    };
+    // Paired with this account, the row has nothing to say; it comes back
+    // when pairing needs the listener. Its words still find the section.
+    let pairing_shown = paired != Some(Paired::ThisAccount) || next == Some(SoloistStep::Pair);
     let rows = [
         RowText::new(gettext(locale, "Use Soloist"), use_detail),
-        RowText::new(gettext(locale, "Program"), program_detail),
-        RowText::new(
-            gettext(locale, "API key"),
-            if key_saved {
-                gettext(locale, "Saved, readable only by you.")
-            } else {
-                gettext(
-                    locale,
-                    "Generate one under Spotify Soloist in the Spotify for Developers dashboard.",
-                )
-            },
-        ),
-        RowText::new(gettext(locale, "Pairing"), pairing_detail),
+        RowText::new(program_title, program_detail).when(!unavailable),
+        RowText::new(gettext(locale, "API key"), key_detail).when(!unavailable),
+        RowText::new(gettext(locale, "Pairing"), pairing_detail).when(!unavailable),
     ];
     if !section_matches(needle, &title, &rows) {
         return;
     }
     *any_visible = true;
-    // The one download button: primary while Soloist needs it.
+    // The download button, primary while Soloist needs it.
     let download = match readiness {
-        _ if !downloadable => None,
+        _ if !downloadable || build_waiting => None,
         Readiness::Checking if !downloading => None,
-        _ if downloading => Some((gettext(locale, "Downloading…"), true)),
-        Readiness::NotFound => Some((gettext(locale, "Download from Spotify"), true)),
+        _ if downloading => Some(gettext(locale, "Downloading…")),
+        Readiness::NotFound => Some(gettext(locale, "Download from Spotify")),
         Readiness::Expired | Readiness::ExpiringSoon { .. } => {
-            Some((gettext(locale, "Update from Spotify"), true))
+            Some(gettext(locale, "Update from Spotify"))
         }
-        _ => Some((gettext(locale, "Check for an update"), false)),
+        _ => Some(gettext(locale, "Check for an update")),
+    };
+    // Turning it on needs Soloist and its key; turning it off never waits.
+    let switchable = on || (found.is_some() && !expired && key_saved);
+    // A search that finds the hidden Pairing row shows the switch, whose
+    // description says how Soloist is doing.
+    let use_needle = if !pairing_shown && rows[3].matches(&needle.trim().to_lowercase(), &title) {
+        ""
+    } else {
+        needle
     };
     section(ui, &palette, &title, |ui| {
-        filtered_row(ui, &palette, needle, &title, &rows[0], |ui| {
-            let mut on = app.settings.soloist == SoloistUse::Always;
-            // Turning it on needs Soloist found; turning it off never waits.
-            let available = found.is_some() || on;
+        filtered_row(ui, &palette, use_needle, &title, &rows[0], |ui| {
+            let mut wanted = on;
             let use_soloist = gettext(locale, "Use Soloist");
             let toggled = ui
-                .add_enabled_ui(available, |ui| {
-                    widgets::switch(ui, &palette, &use_soloist, &mut on)
+                .add_enabled_ui(switchable, |ui| {
+                    widgets::switch(ui, &palette, &use_soloist, &mut wanted)
                 })
                 .inner
                 .changed();
             if toggled {
-                app.settings.soloist = if on {
+                app.settings.soloist = if wanted {
                     SoloistUse::Always
                 } else {
                     SoloistUse::Off
                 };
                 *changed = true;
-                *playback_dirty = true;
+                // Applied at once, with any playback setting waiting to be.
+                app.actions.push(Action::RestartEngine);
+                *playback_dirty = false;
+            }
+            if try_again
+                && theme::soft_button(ui, &palette, None, &gettext(locale, "Try again"), false)
+                    .clicked()
+            {
+                app.actions.push(Action::RestartSoloist);
             }
         });
+        let program_next = next == Some(SoloistStep::Program);
         filtered_row(ui, &palette, needle, &title, &rows[1], |ui| {
-            // Laid right to left: the download button sits at the edge.
-            if let Some((label, primary)) = &download {
+            // Laid right to left: the first button sits at the edge.
+            if build_waiting {
+                if theme::pill_button(ui, &palette, &gettext(locale, "Restart to use it"), true)
+                    .clicked()
+                {
+                    app.actions.push(Action::RestartSoloist);
+                }
+            } else if let Some(label) = &download {
                 let clicked = ui
                     .add_enabled_ui(!downloading, |ui| {
-                        if *primary {
+                        if program_next {
                             theme::pill_button(ui, &palette, label, true)
                         } else {
                             theme::soft_button(ui, &palette, None, label, false)
@@ -597,7 +686,7 @@ fn soloist_section(
                 }
             }
             if found.is_none()
-                && !unavailable
+                && !override_missing
                 && theme::soft_button(
                     ui,
                     &palette,
@@ -611,93 +700,109 @@ fn soloist_section(
                     .push(Action::OpenUrl(crate::soloist::DOWNLOADS_URL.into()));
             }
         });
+        let key_next = next == Some(SoloistStep::Key);
         filtered_row(ui, &palette, needle, &title, &rows[2], |ui| {
-            let input_id = egui::Id::new(SOLOIST_KEY_INPUT_ID);
-            let mut key = ui
-                .data(|data| data.get_temp::<String>(input_id))
-                .unwrap_or_default();
-            ui.horizontal(|ui| {
-                let save = gettext(locale, "Save key");
-                // Laid right to left: the button sits at the edge.
-                let clicked = theme::soft_button(ui, &palette, None, &save, false).clicked();
-                Frame::new()
-                    .fill(palette.surface)
-                    .corner_radius(CornerRadius::same(6))
-                    .inner_margin(Margin::symmetric(10, 6))
-                    .show(ui, |ui| {
-                        widgets::text_edit(
-                            ui,
-                            locale,
-                            egui::TextEdit::singleline(&mut key)
-                                .password(true)
-                                .hint_text(if key_saved {
-                                    "••••••••"
-                                } else {
-                                    ""
-                                })
-                                .font(theme::regular(14.0))
-                                .frame(egui::Frame::NONE)
-                                .desired_width(160.0),
-                        )
-                    });
-                // Where the key is made, beside the field it goes in.
-                if theme::icon_button(
-                    ui,
-                    Icon::ExternalLink,
-                    15.0,
-                    palette.secondary,
-                    palette.text,
-                    &gettext(locale, "Open the Spotify for Developers dashboard"),
-                )
-                .clicked()
-                {
-                    app.actions
-                        .push(Action::OpenUrl(crate::soloist::DASHBOARD_URL.into()));
-                }
-                if clicked && !key.trim().is_empty() {
-                    let path = app.dirs.soloist_key_file();
-                    app.files.write_or(
-                        &path,
-                        key.trim().as_bytes().to_vec(),
-                        fastframe_file::Access::Private,
-                        || log::error!("unable to save the Soloist API key"),
-                    );
-                    key.clear();
-                    ui.data_mut(|data| data.insert_temp(egui::Id::new(SOLOIST_KEY_SAVED_ID), true));
-                    // Read again, so the audio-key banner knows it is saved.
-                    app.soloist_inspected = false;
-                    *playback_dirty = true;
-                }
-            });
-            ui.data_mut(|data| data.insert_temp(input_id, key));
+            soloist_key_controls(app, ui, key_saved && !key_suspect, key_next);
         });
-        filtered_row(ui, &palette, needle, &title, &rows[3], |_| {});
-        if *playback_dirty {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if theme::pill_button(
-                    ui,
-                    &palette,
-                    &gettext(locale, "Apply and restart playback"),
-                    true,
-                )
-                .clicked()
+        if pairing_shown {
+            filtered_row(ui, &palette, needle, &title, &rows[3], |ui| {
+                if stuck
+                    && theme::soft_button(
+                        ui,
+                        &palette,
+                        None,
+                        &gettext(locale, "Restart Soloist"),
+                        false,
+                    )
+                    .clicked()
                 {
-                    app.actions.push(Action::RestartEngine);
-                    *playback_dirty = false;
+                    ui.data_mut(|data| data.remove::<f64>(waiting_id));
+                    app.actions.push(Action::RestartSoloist);
                 }
-                theme::subtle(
-                    ui,
-                    &palette,
-                    &gettext(locale, "Restart local playback to apply these settings."),
-                );
             });
         }
     });
 }
 
+/// The API key's controls: the field to paste one in, while none is saved
+/// or a new one is wanted, and Replace and Remove once one is. `primary`:
+/// the key is what Soloist needs next.
+fn soloist_key_controls(app: &mut App, ui: &mut egui::Ui, saved: bool, primary: bool) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let editing_id = egui::Id::new(SOLOIST_KEY_EDITING_ID);
+    let editing = !saved || ui.data(|data| data.get_temp::<bool>(editing_id).unwrap_or(false));
+    // Laid right to left: the first control sits at the edge.
+    if !editing {
+        if theme::soft_button(ui, &palette, None, &gettext(locale, "Remove"), false).clicked() {
+            app.actions.push(Action::SaveSoloistKey(None));
+        }
+        if theme::soft_button(ui, &palette, None, &gettext(locale, "Replace"), false).clicked() {
+            ui.data_mut(|data| data.insert_temp(editing_id, true));
+        }
+        return;
+    }
+    let input_id = egui::Id::new(SOLOIST_KEY_INPUT_ID);
+    let mut key = ui
+        .data(|data| data.get_temp::<String>(input_id))
+        .unwrap_or_default();
+    let save = gettext(locale, "Save key");
+    let mut submitted = if primary {
+        theme::pill_button(ui, &palette, &save, true)
+    } else {
+        theme::soft_button(ui, &palette, None, &save, false)
+    }
+    .clicked();
+    if saved && theme::soft_button(ui, &palette, None, &gettext(locale, "Cancel"), false).clicked()
+    {
+        key.clear();
+        ui.data_mut(|data| data.insert_temp(editing_id, false));
+    }
+    Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            let field = widgets::text_edit(
+                ui,
+                locale,
+                egui::TextEdit::singleline(&mut key)
+                    .password(true)
+                    .font(theme::regular(14.0))
+                    .frame(egui::Frame::NONE)
+                    .desired_width(160.0),
+            );
+            submitted |=
+                field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        });
+    // Where the key is made, beside the field it goes in.
+    if theme::icon_button(
+        ui,
+        Icon::ExternalLink,
+        15.0,
+        palette.secondary,
+        palette.text,
+        &gettext(locale, "Open the Spotify for Developers dashboard"),
+    )
+    .clicked()
+    {
+        app.actions
+            .push(Action::OpenUrl(crate::soloist::DASHBOARD_URL.into()));
+    }
+    if submitted && !key.trim().is_empty() {
+        app.actions
+            .push(Action::SaveSoloistKey(Some(crate::soloist::ApiKey(
+                key.trim().to_string(),
+            ))));
+        key.clear();
+        ui.data_mut(|data| data.insert_temp(editing_id, false));
+    }
+    ui.data_mut(|data| data.insert_temp(input_id, key));
+}
+
 /// `section` for one that only works with librespot's player: while Spotify
-/// Soloist plays, `notice` says so and its controls are greyed out.
+/// Soloist plays, its controls are greyed out and hovering them gives
+/// `notice`, the reason. It reads the same either way.
 fn librespot_section(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -707,9 +812,11 @@ fn librespot_section(
 ) {
     section(ui, palette, title, |ui| match notice {
         Some(notice) => {
-            theme::subtle(ui, palette, notice);
-            ui.add_space(6.0);
-            ui.add_enabled_ui(false, add_contents);
+            ui.scope(|ui| {
+                ui.add_enabled_ui(false, add_contents);
+            })
+            .response
+            .on_hover_text(notice);
         }
         None => add_contents(ui),
     });
