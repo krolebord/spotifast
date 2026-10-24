@@ -19895,6 +19895,66 @@ mod tests {
         assert_eq!(queue_uris(&app).1.len(), 4);
     }
 
+    /// Soloist keeps its last song, stopped, once a phone takes over. The
+    /// phone is then the player, as with librespot: songs queue there, and
+    /// only at the end.
+    #[test]
+    fn a_stopped_soloist_leaves_the_queue_to_the_phone_playing() {
+        let mut app = test_app("soloist-phone-queue");
+        app.local_ready = true;
+        app.local_device_id = Some("soloist".into());
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:earlier".into(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Stopped;
+        app.remote = Some(RemoteSnapshot {
+            state: PlaybackState {
+                device: Some(crate::api::models::Device {
+                    id: Some("phone".into()),
+                    name: "Phone".into(),
+                    is_active: true,
+                    ..Default::default()
+                }),
+                item: Some(crate::api::models::PlayableItem::Track(
+                    crate::api::models::Track {
+                        uri: "spotify:track:playing".into(),
+                        ..Default::default()
+                    },
+                )),
+                is_playing: true,
+                ..Default::default()
+            },
+            received_at: Instant::now(),
+        });
+        app.queue = loaded_queue("spotify:track:playing", &["spotify:track:context"]);
+
+        assert_eq!(app.target(), Target::Remote(Some("phone".into())));
+        assert!(!app.queue_locally_reorderable());
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::PlayNext {
+                items: vec![queued_song("spotify:track:next")],
+            },
+            &ctx,
+        );
+        assert_eq!(queue_uris(&app).1, ["spotify:track:context"]);
+
+        app.add_to_queue("spotify:track:added".into(), "Added".into());
+        assert!(app.backend.take_queued_tracks().is_empty());
+        let requests = app.backend.take_queue_requests();
+        assert!(matches!(
+            &requests[..],
+            [ApiRequest::AddManyToQueue { uris, device_id, .. }]
+                if uris == &["spotify:track:added"] && device_id.as_deref() == Some("phone")
+        ));
+        assert_eq!(
+            queue_uris(&app).1,
+            ["spotify:track:added", "spotify:track:context"]
+        );
+        app.backend.shutdown();
+    }
+
     /// Inserting a dropped song into "Playing next" must keep every earlier
     /// pending addition pointing at its own song, not the newly inserted row.
     #[test]

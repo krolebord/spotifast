@@ -12,6 +12,10 @@
 //! does librespot's. The writer takes such a run of commands together,
 //! works out the queue they leave, appends the songs Soloist lacks, and
 //! then puts the whole list in order with one `set_queue`.
+//!
+//! Only Soloist's queue is written here. While another device plays, the
+//! app queues there itself, as with librespot; a run that still reaches
+//! this writer is refused, and the app is told.
 
 use std::time::Duration;
 
@@ -22,6 +26,8 @@ use librespot_protocol::player::{PlayerState, ProvidedTrack};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 
+use crate::player::{EngineEvent, Notify};
+
 /// How long to wait for the rest of a run of commands sent together.
 const GATHER: Duration = Duration::from_millis(50);
 /// How long Spotify gets to report a change before the next one is read.
@@ -30,6 +36,18 @@ const SETTLE: Duration = Duration::from_secs(4);
 const ATTEMPTS: usize = 3;
 /// The provider Spotify gives songs the listener queued.
 const QUEUED: &str = "queue";
+
+/// Another device plays: Soloist's queue is not the one playing.
+#[derive(Debug)]
+struct NotActive;
+
+impl std::fmt::Display for NotActive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Soloist is not the active device")
+    }
+}
+
+impl std::error::Error for NotActive {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -52,6 +70,7 @@ impl Writer {
         to: String,
         states: watch::Receiver<Option<PlayerState>>,
         cluster: watch::Receiver<ClusterState>,
+        notify: Notify,
     ) -> Self {
         let (ops, receiver) = mpsc::unbounded_channel();
         let remote = Remote {
@@ -59,6 +78,7 @@ impl Writer {
             to,
             states,
             cluster,
+            notify,
         };
         tokio::spawn(run(remote, receiver));
         Self { ops }
@@ -76,6 +96,7 @@ struct Remote {
     to: String,
     states: watch::Receiver<Option<PlayerState>>,
     cluster: watch::Receiver<ClusterState>,
+    notify: Notify,
 }
 
 async fn run(mut remote: Remote, mut receiver: mpsc::UnboundedReceiver<Op>) {
@@ -87,6 +108,12 @@ async fn run(mut remote: Remote, mut receiver: mpsc::UnboundedReceiver<Op>) {
         }
         if let Err(error) = remote.apply(&ops).await {
             log::warn!("Soloist's queue was not updated: {error:#}");
+            // Only a refusal is certain; anything else may still land.
+            if error.is::<NotActive>() {
+                (remote.notify)(EngineEvent::Error(
+                    "Soloist isn't playing, so the queue wasn't changed.".into(),
+                ));
+            }
         }
     }
 }
@@ -135,7 +162,7 @@ impl Remote {
     /// Soloist's player state, once Spotify reports Soloist as active.
     fn state(&self) -> Result<PlayerState> {
         if self.cluster.borrow().active_device_id.as_deref() != Some(self.to.as_str()) {
-            bail!("Soloist is not the active device");
+            return Err(NotActive.into());
         }
         self.states
             .borrow()
