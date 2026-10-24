@@ -643,6 +643,13 @@ pub struct Soloist {
     /// The process, for a stop that cannot wait on the runtime.
     pid: Option<u32>,
     stopping: std::sync::atomic::AtomicBool,
+    /// Spotify reports another device as the active one. Soloist's own
+    /// events may still describe its last song as paused; while this holds
+    /// they cannot make this computer the player again.
+    elsewhere: Arc<std::sync::atomic::AtomicBool>,
+    /// Until when a play asked of this computer outweighs Spotify still
+    /// naming another device: its report lags behind the request.
+    claimed_until: Mutex<Option<Instant>>,
     device_id: String,
     stop: watch::Sender<bool>,
     ended: watch::Receiver<bool>,
@@ -769,6 +776,8 @@ impl Soloist {
         let reader_notify = Arc::clone(&shared_notify);
         let reader_ended = ended_tx.clone();
         let reader_commands = commands.clone();
+        let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_elsewhere = Arc::clone(&elsewhere);
         tokio::spawn(async move {
             while let Some(message) = stream.next().await {
                 let text = match message {
@@ -799,16 +808,15 @@ impl Soloist {
                         event["message"].as_str().unwrap_or("unknown error")
                     );
                 }
-                let snapshot = {
-                    let mut current = reader_state.lock().unwrap_or_else(|p| p.into_inner());
-                    apply_event(&mut current, &event, now_ms()).then(|| current.clone())
-                };
-                if let Some(snapshot) = snapshot {
+                // Sent under the lock, so snapshots reach the app in the
+                // order they were taken.
+                let mut current = reader_state.lock().unwrap_or_else(|p| p.into_inner());
+                if apply_event_from(&mut current, &event, now_ms(), &reader_elsewhere) {
                     let notify = reader_notify
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .clone();
-                    notify(EngineEvent::State(snapshot));
+                    notify(EngineEvent::State(current.clone()));
                 }
             }
             let _ = reader_ended.send(true);
@@ -853,6 +861,8 @@ impl Soloist {
             notify: shared_notify,
             pid,
             stopping: std::sync::atomic::AtomicBool::new(false),
+            elsewhere,
+            claimed_until: Mutex::new(None),
             device_id: String::new(),
             stop,
             ended,
@@ -951,15 +961,105 @@ impl Soloist {
         *self.notify.lock().unwrap_or_else(|p| p.into_inner()) = notify;
     }
 
+    /// Follows Spotify's active device, as `cluster` from the librespot
+    /// device beside Soloist reports it, until that device goes. Another
+    /// device taking over stops this computer's player, whatever Soloist's
+    /// own events last said, so the app sends its commands there instead.
+    pub fn follow_active_device(
+        self: &Arc<Self>,
+        mut cluster: watch::Receiver<librespot_connect::ClusterState>,
+    ) {
+        let soloist = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut seen = None;
+            loop {
+                let active = cluster.borrow_and_update().active_device_id.clone();
+                let Some(current) = soloist.upgrade() else {
+                    return;
+                };
+                if seen.as_ref() != Some(&active) {
+                    current.active_device_changed(active.as_deref());
+                    seen = Some(active);
+                }
+                let claimed_until = current.claimed_until();
+                drop(current);
+                match claimed_until {
+                    Some(until) => {
+                        tokio::select! {
+                            changed = cluster.changed() => {
+                                if changed.is_err() {
+                                    return;
+                                }
+                            }
+                            () = tokio::time::sleep_until(until.into()) => {
+                                // The claim lapsed: whoever Spotify names now
+                                // is the player, even if unchanged.
+                                seen = None;
+                            }
+                        }
+                    }
+                    None => {
+                        if cluster.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn active_device_changed(&self, active: Option<&str>) {
+        use std::sync::atomic::Ordering;
+        let claimed = self.claimed_until().is_some();
+        match plays_elsewhere(&self.device_id, active, claimed) {
+            Some(false) => {
+                *self.claimed_until.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                if self.elsewhere.swap(false, Ordering::SeqCst) {
+                    // Picked again from elsewhere: catch up on what it plays.
+                    let _ = self.send("get_state", json!({}));
+                }
+            }
+            Some(true) => {
+                self.elsewhere.store(true, Ordering::SeqCst);
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                if deactivate(&mut state) {
+                    self.send_state(&state);
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The listener asked this computer to play: Soloist's next events
+    /// count again, before Spotify reports it as the active device.
+    pub fn claim(&self) {
+        *self.claimed_until.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now() + CLAIM);
+        self.elsewhere
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// When the current claim lapses, if it has not yet.
+    fn claimed_until(&self) -> Option<Instant> {
+        let until = *self.claimed_until.lock().unwrap_or_else(|p| p.into_inner());
+        until.filter(|until| *until > Instant::now())
+    }
+
     /// The current snapshot, sent to the current engine's channel.
     pub fn publish(&self) {
-        let snapshot = self.state.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        self.send_state(&state);
+    }
+
+    /// Sends `state`, which the caller holds locked so that a newer
+    /// snapshot cannot be overtaken by this one.
+    fn send_state(&self, state: &LocalState) {
         let notify = self
             .notify
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        notify(EngineEvent::State(snapshot));
+        notify(EngineEvent::State(state.clone()));
     }
 
     /// Stops the Soloist process.
@@ -1109,6 +1209,9 @@ async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) 
         .map_err(|error| anyhow!("{error}"))
 }
 
+/// How long a play asked of this computer outweighs Spotify naming another
+/// device. Past it, a play that never started leaves that device the player.
+const CLAIM: Duration = Duration::from_secs(10);
 /// The start of the message shown while Soloist waits to be paired.
 const PAIRING_NEEDED: &str = "Soloist is waiting to be paired.";
 /// The start of the message shown when Soloist exits before it is ready.
@@ -1415,6 +1518,39 @@ pub(crate) fn apply_event(state: &mut LocalState, event: &Value, now_ms: i64) ->
         ),
         _ => false,
     }
+}
+
+/// Whether Spotify's `active` device is one other than Soloist's
+/// `device_id`. `None` when that says nothing: no device is active, and
+/// Soloist stays as it was; Soloist's id is not known; or this computer was
+/// just asked to play, and Spotify has not caught up yet.
+fn plays_elsewhere(device_id: &str, active: Option<&str>, claimed: bool) -> Option<bool> {
+    match active {
+        _ if device_id.is_empty() => None,
+        Some(id) if id == device_id => Some(false),
+        Some(_) if claimed => None,
+        Some(_) => Some(true),
+        None => None,
+    }
+}
+
+/// [`apply_event`], while `elsewhere` says whether another device is
+/// active. Then Soloist's events keep its last song, but not as playing or
+/// paused, until an event says it is active again.
+fn apply_event_from(
+    state: &mut LocalState,
+    event: &Value,
+    now_ms: i64,
+    elsewhere: &std::sync::atomic::AtomicBool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let mut changed = apply_event(state, event, now_ms);
+    if event["is_active"] == true {
+        elsewhere.store(false, Ordering::SeqCst);
+    } else if elsewhere.load(Ordering::SeqCst) {
+        changed |= deactivate(state);
+    }
+    changed
 }
 
 /// Another device took over: this computer plays nothing now.
@@ -1909,6 +2045,44 @@ mod tests {
         // The same song again changes nothing.
         assert!(!apply_event(&mut state, &track_event(), 0));
         assert_eq!(state.track_sequence, 1);
+    }
+
+    #[test]
+    fn only_another_active_device_takes_playback_from_soloist() {
+        assert_eq!(plays_elsewhere("solo", Some("phone"), false), Some(true));
+        assert_eq!(plays_elsewhere("solo", Some("solo"), false), Some(false));
+        assert_eq!(plays_elsewhere("solo", None, false), None);
+        assert_eq!(plays_elsewhere("", Some("phone"), false), None);
+    }
+
+    #[test]
+    fn a_play_asked_here_outweighs_spotify_still_naming_another_device() {
+        // Spotify has not caught up with the play yet: nothing changes.
+        assert_eq!(plays_elsewhere("solo", Some("phone"), true), None);
+        // It has: Soloist plays.
+        assert_eq!(plays_elsewhere("solo", Some("solo"), true), Some(false));
+    }
+
+    #[test]
+    fn soloist_events_do_not_make_it_the_player_while_another_device_plays() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let elsewhere = AtomicBool::new(false);
+        let mut state = LocalState::default();
+        apply_event_from(&mut state, &track_event(), 0, &elsewhere);
+        let paused = json!({ "type": "playback_changed", "status": "paused" });
+        apply_event_from(&mut state, &paused, 0, &elsewhere);
+        assert!(state.is_active());
+
+        elsewhere.store(true, Ordering::SeqCst);
+        apply_event_from(&mut state, &paused, 0, &elsewhere);
+        assert_eq!(state.playback, Playback::Stopped);
+        assert!(!state.is_active());
+        assert!(state.track.is_some());
+
+        let active = json!({ "type": "playback_state", "status": "playing", "is_active": true });
+        apply_event_from(&mut state, &active, 0, &elsewhere);
+        assert!(!elsewhere.load(Ordering::SeqCst));
+        assert_eq!(state.playback, Playback::Playing);
     }
 
     #[test]

@@ -315,6 +315,8 @@ pub enum EngineEvent {
     SessionEnded,
     /// Soloist, started without a session, was paired from Spotify's app.
     SoloistSignedIn,
+    /// Something the listener asked for failed after its command was taken.
+    Error(String),
     /// The output opened on the device an older build saved by `name`;
     /// the setting holds its `id` from now on.
     AudioDevice {
@@ -570,11 +572,13 @@ impl Engine {
         };
         // librespot's idle device is told Soloist's queue, revision included.
         let soloist_queue = soloist.as_ref().map(|soloist| {
+            soloist.follow_active_device(spirc.watch_cluster_state());
             crate::soloist::queue::Writer::spawn(
                 session.clone(),
                 soloist.device_id().to_string(),
                 spirc.watch_player_state(),
                 spirc.watch_cluster_state(),
+                Arc::clone(&notify),
             )
         });
         Ok(Self {
@@ -1022,11 +1026,15 @@ impl Engine {
                 soloist.send("set_shuffle", json!({ "enabled": enabled }))?;
             }
             PlayerCommand::Repeat(mode) => soloist.set_repeat(mode)?,
-            PlayerCommand::Transfer => soloist.send("activate", json!({}))?,
+            PlayerCommand::Transfer => {
+                soloist.claim();
+                soloist.send("activate", json!({}))?;
+            }
             PlayerCommand::Load(spec) => {
                 if spec.context_uri.is_none() && spec.uris.is_empty() {
                     anyhow::bail!("nothing to play");
                 }
+                soloist.claim();
                 {
                     let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     state.loading = true;
