@@ -1381,6 +1381,10 @@ pub enum Action {
     SetUpSoloist,
     /// Download Spotify's newest Soloist build from Spotify's servers.
     DownloadSoloist,
+    /// Save the Soloist API key, or remove it with `None`.
+    SaveSoloistKey(Option<crate::soloist::ApiKey>),
+    /// Start Soloist again, with its newest build and key.
+    RestartSoloist,
     /// Rebuild the HTTP client with the proxy in settings. Local playback
     /// restarts only when its HTTP proxy changed.
     ApplyProxy,

@@ -258,23 +258,40 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
     }
     let listed = app.output_devices.get().map_or(&[][..], Vec::as_slice);
     // Soloist plays to the system's output itself; the choice waits for
-    // librespot.
+    // librespot, greyed out with the reason on hover.
     let soloist_plays = app.settings.soloist == crate::settings::SoloistUse::Always;
-    let current_name = if soloist_plays {
-        Some(gettext(locale, "Spotify Soloist plays to the system's audio output").into_owned())
+    let current_name = current
+        .as_deref()
+        .map(|saved| saved_output_name(saved, listed).to_string());
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), 44.0),
+        if soloist_plays {
+            Sense::hover()
+        } else {
+            Sense::click()
+        },
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, !soloist_plays, label.as_ref())
+    });
+    let response = if soloist_plays {
+        response.on_hover_text(gettext(
+            locale,
+            "Not used while Spotify Soloist plays: it plays to the system's audio output.",
+        ))
     } else {
-        current
-            .as_deref()
-            .map(|saved| saved_output_name(saved, listed).to_string())
+        response
     };
-    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), Sense::click());
-    response
-        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label.as_ref()));
+    let (text_color, detail_color) = if soloist_plays {
+        (palette.dim, palette.dim)
+    } else {
+        (palette.text, palette.secondary)
+    };
     if response.hovered() && !soloist_plays {
         ui.painter()
             .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
     }
-    Icon::Volume2.image(palette.secondary, 18.0).paint_at(
+    Icon::Volume2.image(detail_color, 18.0).paint_at(
         ui,
         Rect::from_center_size(
             pos2(rect.left() + 24.0, rect.center().y),
@@ -287,7 +304,7 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
         egui::Align2::LEFT_CENTER,
         label.as_ref(),
         theme::medium(13.0),
-        palette.text,
+        text_color,
     );
     crate::bidi::paint_line(
         &painter,
@@ -296,7 +313,7 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
         rect.center().y + 9.0,
         current_name.as_deref().unwrap_or(&system_default),
         theme::regular(12.0),
-        palette.secondary,
+        detail_color,
     );
     if soloist_plays {
         return;
