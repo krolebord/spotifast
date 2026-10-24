@@ -6175,8 +6175,8 @@ mod tests {
         app.backend.shutdown();
     }
 
-    /// While Spotify Soloist plays, librespot's own settings are greyed out
-    /// with the reason, and a click leaves their value as it was.
+    /// While Spotify Soloist plays, librespot's own settings are greyed out,
+    /// hovering one says why, and a click leaves their value as it was.
     #[test]
     fn librespot_settings_are_greyed_out_while_soloist_plays() {
         use egui::accesskit::{Action as AccessibleAction, Role};
@@ -6197,17 +6197,31 @@ mod tests {
         filter("Normalize");
         accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
-        assert!(shows(
-            &tree,
-            "Keep loud and quiet tracks at a similar level. Not used while Spotify Soloist plays."
-        ));
-        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
         assert!(
-            tree.nodes
-                .iter()
-                .any(|(id, node)| *id == switch && node.is_disabled()),
-            "greyed out"
+            shows(&tree, "Keep loud and quiet tracks at a similar level."),
+            "the description stays as it is"
         );
+        let reason = "Not used while Spotify Soloist plays.";
+        assert!(!shows(&tree, reason), "the reason waits for a hover");
+        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        let bounds = tree
+            .nodes
+            .iter()
+            .find(|(id, node)| *id == switch && node.is_disabled())
+            .and_then(|(_, node)| node.bounds())
+            .expect("greyed out");
+        let over = egui::pos2(
+            ((bounds.x0 + bounds.x1) / 2.0) as f32,
+            ((bounds.y0 + bounds.y1) / 2.0) as f32,
+        );
+        ctx.all_styles_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let mut hovered = false;
+        for _ in 0..4 {
+            let tree = accessible_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(over)]);
+            hovered |= shows(&tree, reason);
+        }
+        assert!(hovered, "hovering the greyed-out row says why");
+        accessible_frame(&ctx, &mut app, vec![egui::Event::PointerGone]);
         accessible_frame(
             &ctx,
             &mut app,
