@@ -26,6 +26,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     ctx.input_mut(|input| {
         let mut key = |modifiers: Modifiers, key: Key, action: Action| {
             if input.consume_key(modifiers, key) {
+                log::info!("shortcut {modifiers:?}+{key:?}: {action:?}");
                 actions.push(action);
             }
         };

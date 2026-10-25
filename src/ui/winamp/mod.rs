@@ -1517,6 +1517,7 @@ fn transport(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         .button(layout::NEXT, sprites::NEXT, sprites::NEXT_PRESSED, "next")
         .clicked()
     {
+        log::info!("Winamp: Next clicked");
         app.actions.push(Action::Next);
     }
     if view

@@ -1404,6 +1404,7 @@ impl Shell {
         }
         #[cfg(windows)]
         for command in self.thumbbar.drain_commands() {
+            log::info!("taskbar button: {command:?}");
             if let Some(action) = command.action(&app.thumb_state(false)) {
                 app.actions.push(action);
             }
