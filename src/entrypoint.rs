@@ -428,7 +428,10 @@ pub(crate) fn run() -> eframe::Result<()> {
     } else {
         None
     };
-    let default_filter = if cli.verbose {
+    let default_filter = if spotifast::DIAGNOSTIC_BUILD {
+        // librespot's spclient tells each request it sends again at debug.
+        "info,librespot=info,librespot_core::spclient=debug,spotifast=debug"
+    } else if cli.verbose {
         "info,librespot=info,spotifast=debug"
     } else {
         // Which system face draws each script the interface font lacks,
@@ -466,6 +469,9 @@ pub(crate) fn run() -> eframe::Result<()> {
         eprintln!("not logging: {error}");
     }
     folders.log();
+    if spotifast::DIAGNOSTIC_BUILD {
+        log::info!("diagnostic build: logging verbosely, Soloist included");
+    }
     if let Err(error) = dirs_ready {
         log::warn!("unable to create the application directories: {error}");
     }
