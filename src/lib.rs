@@ -63,3 +63,7 @@ pub mod vis;
 pub mod winamp;
 pub mod window;
 pub mod zeroconf;
+
+/// A build made for chasing a bug, with SPOTIFAST_DIAGNOSTIC_BUILD set when
+/// it compiled: it logs verbosely, Soloist included, without being asked.
+pub const DIAGNOSTIC_BUILD: bool = option_env!("SPOTIFAST_DIAGNOSTIC_BUILD").is_some();

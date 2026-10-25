@@ -3,8 +3,17 @@ name: Windows build
 # Builds Windows x86_64 on demand, as the release workflow's Windows job
 # does, but publishes nothing: the zip and installer are left as the run's
 # artifact.
+#
+# The fast build is for chasing a bug on Windows: optimised, but without
+# link-time optimisation and spread over every core, and logging verbosely,
+# Soloist included, without SPOTIFAST_SOLOIST_VERBOSE or RUST_LOG.
 on:
   workflow_dispatch:
+    inputs:
+      fast:
+        description: "Fast diagnostic build: no LTO, verbose logging by default"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -19,11 +28,25 @@ jobs:
       CMAKE_GENERATOR: Ninja
       TARGET: x86_64-pc-windows-msvc
     steps:
+      # Set only for a fast build: SPOTIFAST_DIAGNOSTIC_BUILD counts as set
+      # even when empty.
+      - name: Fast diagnostic build
+        if: ${{ inputs.fast }}
+        shell: bash
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=false" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=256" >> "$GITHUB_ENV"
+          echo "SPOTIFAST_DIAGNOSTIC_BUILD=1" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
       - run: rustup target add x86_64-pc-windows-msvc
+      # Dependencies compiled by an earlier run of the same kind are kept, so
+      # a change to Spotifast alone rebuilds only Spotifast.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.fast && 'fast' || 'release' }}
       # libprojectM reads OpenGL through GLEW on Windows; projectm-sys builds
       # against vcpkg's static-CRT triplet, matching .cargo/config.toml.
       - name: GLEW for libprojectM
@@ -47,7 +70,9 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          name="spotifast-${GITHUB_SHA::7}-$TARGET"
+          kind=""
+          if [ -n "$SPOTIFAST_DIAGNOSTIC_BUILD" ]; then kind="-diagnostic"; fi
+          name="spotifast-${GITHUB_SHA::7}$kind-$TARGET"
           mkdir -p "dist/$name"
           cp "target/$TARGET/release/spotifast.exe" README.md LICENSE \
             packaging/spotifast-portable.txt "dist/$name/"
@@ -68,7 +93,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: spotifast-windows-x86_64
+          name: spotifast-windows-x86_64${{ inputs.fast && '-diagnostic' || '' }}
           path: |
             dist/*.zip
             dist/*-setup.exe
