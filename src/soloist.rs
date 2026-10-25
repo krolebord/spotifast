@@ -1080,6 +1080,12 @@ impl Soloist {
 
     /// Sends one command, with its fields, to Soloist's API.
     pub fn send(&self, command: &str, fields: Value) -> Result<()> {
+        // Volume drags send many; everything else is told at once.
+        if command == "set_volume" {
+            log::debug!("Soloist command: {command} {fields}");
+        } else {
+            log::info!("Soloist command: {command} {fields}");
+        }
         let mut message = json!({ "type": "command", "command": command });
         if let (Some(message), Value::Object(fields)) = (message.as_object_mut(), fields) {
             message.extend(fields);
@@ -1125,14 +1131,31 @@ impl Soloist {
     /// Soloist plays the chosen song or context from its start.
     pub async fn load(self: Arc<Self>, session: Session, spec: LoadSpec) {
         let body = load_body(&spec);
+        let summary = load_summary(&spec);
         let mut result = if self.device_id.is_empty() {
             Err(anyhow!("Soloist's Connect device id is unknown"))
         } else {
-            connect_command(&session, session.device_id(), &self.device_id, &body).await
+            logged_load(
+                &session,
+                session.device_id(),
+                &self.device_id,
+                &body,
+                "from this computer",
+                &summary,
+            )
+            .await
         };
         if result.is_err() && !self.device_id.is_empty() {
             // `to` as the source too means "from whichever device is active".
-            result = connect_command(&session, &self.device_id, &self.device_id, &body).await;
+            result = logged_load(
+                &session,
+                &self.device_id,
+                &self.device_id,
+                &body,
+                "from Soloist itself",
+                &summary,
+            )
+            .await;
         }
         let Err(error) = result else {
             return;
@@ -1193,6 +1216,30 @@ fn load_body(spec: &LoadSpec) -> Value {
     json!({ "command": command })
 }
 
+/// One load attempt over Connect, told in the log with how long it took:
+/// librespot sends a request again after a timeout or a server error, so a
+/// slow answer may stand for more than one play reaching Soloist.
+async fn logged_load(
+    session: &Session,
+    from: &str,
+    to: &str,
+    body: &Value,
+    route: &str,
+    summary: &str,
+) -> Result<()> {
+    log::info!("Soloist load over Connect {route}: {summary}");
+    let started = Instant::now();
+    let result = connect_command(session, from, to, body).await;
+    let elapsed = started.elapsed().as_millis();
+    match &result {
+        Ok(()) => log::info!("Soloist load over Connect {route} accepted after {elapsed} ms"),
+        Err(error) => {
+            log::warn!("Soloist load over Connect {route} failed after {elapsed} ms: {error:#}")
+        }
+    }
+    result
+}
+
 /// Sends a player command from `from` to `to` over the session.
 async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) -> Result<()> {
     let path = format!("/connect-state/v1/player/command/from/{from}/to/{to}");
@@ -1207,6 +1254,27 @@ async fn connect_command(session: &Session, from: &str, to: &str, body: &Value) 
         .await
         .map(drop)
         .map_err(|error| anyhow!("{error}"))
+}
+
+/// A load, as the log tells it: what it plays, from where, and how.
+fn load_summary(spec: &LoadSpec) -> String {
+    let what = match (&spec.context_uri, spec.uris.len()) {
+        (Some(context), _) => context.clone(),
+        (None, 1) => spec.uris[0].clone(),
+        (None, count) => format!("{count} songs"),
+    };
+    let start = match (&spec.offset_uri, spec.offset_index) {
+        (Some(uri), _) => format!(" at {uri}"),
+        (None, Some(index)) => format!(" at #{index}"),
+        (None, None) => String::new(),
+    };
+    format!(
+        "{what}{start}, position {} ms, shuffle {:?}, repeat {:?}, {}",
+        spec.position_ms,
+        spec.shuffle,
+        spec.repeat,
+        if spec.play { "playing" } else { "paused" }
+    )
 }
 
 /// How long a play asked of this computer outweighs Spotify naming another
@@ -1376,10 +1444,10 @@ async fn stop_stale(data_dir: &Path) {
     let _ = data_dir;
 }
 
-/// SPOTIFAST_SOLOIST_VERBOSE=1 runs Soloist verbosely and logs all of it,
-/// for diagnosing.
+/// SPOTIFAST_SOLOIST_VERBOSE=1, or a diagnostic build, runs Soloist
+/// verbosely and logs all of it, for diagnosing.
 fn verbose() -> bool {
-    std::env::var_os("SPOTIFAST_SOLOIST_VERBOSE").is_some()
+    crate::DIAGNOSTIC_BUILD || std::env::var_os("SPOTIFAST_SOLOIST_VERBOSE").is_some()
 }
 
 /// Soloist's output goes to the log, with the API key masked and detail
@@ -1834,6 +1902,37 @@ mod tests {
         );
         assert!(is_key_suspect(&exited));
         assert!(!is_key_suspect("Spotify Soloist stopped unexpectedly"));
+    }
+
+    #[test]
+    fn a_load_is_summarised_for_the_log() {
+        let spec =
+            |context: Option<&str>, uris: &[&str], offset_uri: Option<&str>, index| LoadSpec {
+                context_uri: context.map(str::to_string),
+                uris: uris.iter().map(|uri| uri.to_string()).collect(),
+                offset_uri: offset_uri.map(str::to_string),
+                offset_index: index,
+                position_ms: 0,
+                play: true,
+                shuffle: Some(true),
+                repeat: None,
+                autoplay: false,
+            };
+        let liked = spec(
+            Some("spotify:user:me:collection"),
+            &[],
+            Some("spotify:track:a"),
+            None,
+        );
+        assert_eq!(
+            load_summary(&liked),
+            "spotify:user:me:collection at spotify:track:a, position 0 ms, shuffle Some(true), repeat None, playing"
+        );
+        let list = spec(None, &["spotify:track:a", "spotify:track:b"], None, Some(1));
+        assert_eq!(
+            load_summary(&list),
+            "2 songs at #1, position 0 ms, shuffle Some(true), repeat None, playing"
+        );
     }
 
     #[test]
