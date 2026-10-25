@@ -4115,6 +4115,7 @@ impl App {
     /// Applies playback commands received from the MilkDrop window.
     #[cfg(feature = "milkdrop")]
     fn milkdrop_command(&mut self, command: &str) {
+        log::info!("MilkDrop command: {command}");
         match command {
             "previous" => self.actions.push(Action::Previous),
             "next" => self.actions.push(Action::Next),
@@ -4453,6 +4454,7 @@ impl App {
                 Event::Menu(TRAY_QUIT) => Action::Quit,
                 Event::Menu(_) => continue,
             };
+            log::info!("tray: {action:?}");
             self.actions.push(action);
         }
     }
@@ -4486,6 +4488,7 @@ impl App {
         let commands: Vec<ControlCommand> =
             std::mem::take(&mut *queue.lock().unwrap_or_else(|p| p.into_inner()));
         for command in commands {
+            log::info!("control command: {command:?}");
             let playing = self.now_playing().is_some_and(|now| now.playing);
             let action = match command {
                 ControlCommand::Show => Some(Action::ShowWindow),
@@ -4532,6 +4535,7 @@ impl App {
             return;
         };
         for command in commands {
+            log::info!("media controls: {command:?}");
             let playing = self.now_playing().is_some_and(|now| now.playing);
             let action = match command {
                 MediaCommand::Play => (!playing).then_some(Action::TogglePlay),
@@ -6106,6 +6110,7 @@ impl App {
         self.queue_start_pending = Some(self.target());
         self.set_play_pending(vec![uri]);
         self.optimistic_playing = Some((true, Instant::now()));
+        log::info!("Next up row {index} chosen: {skips} skips to {uri}");
         match self.target() {
             Target::Local => {
                 for _ in 0..skips {
@@ -11100,6 +11105,7 @@ impl App {
                 // Move the queue head to the playing row immediately. Do not
                 // pop when there is no active playback target.
                 let target = self.target();
+                log::info!("Next applied, to {target:?}");
                 if !matches!(target, Target::Remote(None)) || self.remote_fresh().is_some() {
                     self.pop_queue_head();
                 }
