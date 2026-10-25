@@ -6099,11 +6099,11 @@ impl App {
                 self.remove_manual_queue_row(at);
             }
         }
+        log::info!("Next up row {index} chosen: {skips} skips to {uri}");
         self.expect_track(uri.clone(), 0);
         self.queue_start_pending = Some(self.target());
         self.set_play_pending(vec![uri]);
         self.optimistic_playing = Some((true, Instant::now()));
-        log::info!("Next up row {index} chosen: {skips} skips to {uri}");
         match self.target() {
             Target::Local => {
                 for _ in 0..skips {
