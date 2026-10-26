@@ -128,6 +128,17 @@ pub fn slot_alive(slot: &Slot) -> bool {
         .unwrap_or(true)
 }
 
+/// The slot's Soloist, while it runs. None also while an engine is
+/// starting one, which holds the slot.
+pub fn running(slot: &Slot) -> Option<Arc<Soloist>> {
+    slot.try_lock().ok().and_then(|running| {
+        running
+            .as_ref()
+            .filter(|running| !running.soloist.has_ended())
+            .map(|running| Arc::clone(&running.soloist))
+    })
+}
+
 /// Names a Soloist executable to use instead of the downloaded one, for
 /// trying a particular build.
 pub const BINARY_ENV: &str = "SPOTIFAST_SOLOIST";
@@ -1376,6 +1387,31 @@ impl Soloist {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Soloist {
+    /// A Soloist with no process behind it: what it is sent arrives on the
+    /// returned channel.
+    pub(crate) fn detached(state: LocalState) -> (Arc<Self>, mpsc::UnboundedReceiver<Value>) {
+        let (commands, sent) = mpsc::unbounded_channel();
+        let soloist = Self {
+            commands,
+            state: Arc::new(Mutex::new(state)),
+            notify: Arc::new(Mutex::new(Arc::new(|_| {}))),
+            pid: None,
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            elsewhere: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            claimed_until: Mutex::new(None),
+            device_id: String::new(),
+            stop: watch::channel(false).0,
+            ended: watch::channel(false).1,
+            exited: watch::channel(false).1,
+            last_preview: Mutex::new(None),
+            acks: broadcast::channel(16).0,
+        };
+        (Arc::new(soloist), sent)
     }
 }
 

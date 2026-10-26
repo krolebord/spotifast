@@ -992,48 +992,16 @@ impl Engine {
         command: PlayerCommand,
     ) -> Result<()> {
         use crate::soloist::queue::Op;
-        use serde_json::json;
+        if let Some(result) = soloist_api_command(soloist, &command) {
+            return result;
+        }
         match command {
-            PlayerCommand::Toggle => {
-                let playing = {
-                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-                    let playing = state.playback == Playback::Playing;
-                    // Shown at once; Soloist's event confirms it.
-                    if playing {
-                        state.position_ms = state.position_now();
-                        state.position_at = None;
-                        state.playback = Playback::Paused;
-                    }
-                    playing
-                };
-                if !playing {
-                    soloist.claim();
-                }
-                for command in soloist_toggle(playing) {
-                    soloist.send(command, json!({}))?;
-                }
-            }
-            PlayerCommand::Next => soloist.send("skip_next", json!({}))?,
-            PlayerCommand::Previous => soloist.send("skip_prev", json!({}))?,
             PlayerCommand::ClearQueue => self.soloist_queue()?.send(Op::Clear)?,
             PlayerCommand::AddToQueue(uri) => {
                 if !matches!(crate::util::uri_kind(&uri), Some("track" | "episode")) {
                     anyhow::bail!("Spotify Soloist can only queue songs and episodes");
                 }
                 self.soloist_queue()?.send(Op::Add(uri))?;
-            }
-            PlayerCommand::Seek(position_ms) => {
-                soloist.send("seek", json!({ "position_ms": position_ms }))?;
-            }
-            PlayerCommand::Volume(volume) => self.note_volume(volume, false)?,
-            PlayerCommand::VolumePreview(volume) => self.note_volume(volume, true)?,
-            PlayerCommand::Shuffle(enabled) => {
-                soloist.send("set_shuffle", json!({ "enabled": enabled }))?;
-            }
-            PlayerCommand::Repeat(mode) => soloist.set_repeat(mode)?,
-            PlayerCommand::Transfer => {
-                soloist.claim();
-                soloist.send("activate", json!({}))?;
             }
             PlayerCommand::Load(spec) => {
                 if spec.context_uri.is_none() && spec.uris.is_empty() {
@@ -1051,9 +1019,63 @@ impl Engine {
                     tokio::runtime::Handle::try_current().context("no runtime to load on")?;
                 runtime.spawn(Arc::clone(soloist).load(self.session.clone(), spec));
             }
+            // Carried out over Soloist's API above.
+            _ => {}
         }
         Ok(())
     }
+}
+
+/// Carries out a command Soloist's own API can take, which needs no
+/// librespot session: it works while that session reconnects. None for
+/// loads and queue edits, which go through Spotify Connect.
+pub fn soloist_api_command(
+    soloist: &crate::soloist::Soloist,
+    command: &PlayerCommand,
+) -> Option<Result<()>> {
+    use serde_json::json;
+    let state = soloist.state();
+    Some(match command {
+        PlayerCommand::Toggle => {
+            let playing = {
+                let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+                let playing = state.playback == Playback::Playing;
+                // Shown at once; Soloist's event confirms it.
+                if playing {
+                    state.position_ms = state.position_now();
+                    state.position_at = None;
+                    state.playback = Playback::Paused;
+                }
+                playing
+            };
+            if !playing {
+                soloist.claim();
+            }
+            soloist_toggle(playing)
+                .iter()
+                .try_for_each(|command| soloist.send(command, json!({})))
+        }
+        PlayerCommand::Next => soloist.send("skip_next", json!({})),
+        PlayerCommand::Previous => soloist.send("skip_prev", json!({})),
+        PlayerCommand::Seek(position_ms) => {
+            soloist.send("seek", json!({ "position_ms": position_ms }))
+        }
+        PlayerCommand::Volume(volume) | PlayerCommand::VolumePreview(volume) => {
+            state.lock().unwrap_or_else(|p| p.into_inner()).volume = *volume;
+            soloist.set_volume(*volume, matches!(command, PlayerCommand::VolumePreview(_)))
+        }
+        PlayerCommand::Shuffle(enabled) => {
+            soloist.send("set_shuffle", json!({ "enabled": enabled }))
+        }
+        PlayerCommand::Repeat(mode) => soloist.set_repeat(*mode),
+        PlayerCommand::Transfer => {
+            soloist.claim();
+            soloist.send("activate", json!({}))
+        }
+        PlayerCommand::Load(_) | PlayerCommand::ClearQueue | PlayerCommand::AddToQueue(_) => {
+            return None;
+        }
+    })
 }
 
 /// What Soloist is sent to pause, or to play. A play first makes it
