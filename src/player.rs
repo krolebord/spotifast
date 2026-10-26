@@ -1006,7 +1006,12 @@ impl Engine {
                     }
                     playing
                 };
-                soloist.send(if playing { "pause" } else { "play" }, json!({}))?;
+                if !playing {
+                    soloist.claim();
+                }
+                for command in soloist_toggle(playing) {
+                    soloist.send(command, json!({}))?;
+                }
             }
             PlayerCommand::Next => soloist.send("skip_next", json!({}))?,
             PlayerCommand::Previous => soloist.send("skip_prev", json!({}))?,
@@ -1048,6 +1053,17 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+/// What Soloist is sent to pause, or to play. A play first makes it
+/// Spotify's active device, which it may have stopped being without
+/// saying so: it would otherwise play unseen by Spotify.
+fn soloist_toggle(playing: bool) -> &'static [&'static str] {
+    if playing {
+        &["pause"]
+    } else {
+        &["activate", "play"]
     }
 }
 
@@ -1519,6 +1535,14 @@ fn decode_folder_name(encoded: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Soloist may have stopped being Spotify's active device without
+    /// saying so: a play makes it the active one again first.
+    #[test]
+    fn a_soloist_play_makes_it_the_active_device_first() {
+        assert_eq!(super::soloist_toggle(false), ["activate", "play"]);
+        assert_eq!(super::soloist_toggle(true), ["pause"]);
+    }
+
     #[test]
     fn loading_another_song_keeps_repeat_with_or_without_shuffle() {
         for shuffle in [None, Some(false), Some(true)] {
