@@ -6333,9 +6333,9 @@ mod tests {
         sidebar_text(&painted, "Add your API key first.");
         assert!(
             painted.iter().any(|(text, _)| {
-                text == "1.3.10.12 · expires in 9 days" || text == "1.3.10.12 · expires in 10 days"
+                text.starts_with("1.3.10.12 · expires ") && !text.contains(" in ")
             }),
-            "the version, and its expiry once it is near"
+            "the version and the date it expires, even when that is near"
         );
         sidebar_text(&painted, "From the Spotify for Developers dashboard.");
         sidebar_text(&painted, "Save key");
@@ -6455,11 +6455,13 @@ mod tests {
         sidebar_text(&painted, "Saved.");
 
         app.local.error = None;
+        // A build near its expiry plays on; its date is the warning, and
+        // checking for an update stays the listener's to ask.
         app.soloist_install = Some(soloist_install(80, &[&me], true));
         let painted = soloist_painted(&ctx, &mut app);
         sidebar_text(&painted, "Playing as Spotifast (soloist).");
         if crate::soloist::ARCHIVE.is_some() {
-            sidebar_text(&painted, "Update from Spotify");
+            sidebar_text(&painted, "Check for an update");
         }
         assert!(!painted_has(&painted, "Try again"));
     }

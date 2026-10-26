@@ -12433,16 +12433,13 @@ impl App {
         let Some(install) = self.soloist_install.as_ref() else {
             return false;
         };
-        matches!(
-            crate::soloist::readiness(&crate::soloist::Facts {
-                install: Some(install),
-                key_saved: install.key_saved,
-                account: self.user_id(),
-                signed_out: false,
-                now: jiff::Timestamp::now(),
-            }),
-            crate::soloist::Readiness::Ready | crate::soloist::Readiness::ExpiringSoon { .. }
-        )
+        crate::soloist::readiness(&crate::soloist::Facts {
+            install: Some(install),
+            key_saved: install.key_saved,
+            account: self.user_id(),
+            signed_out: false,
+            now: jiff::Timestamp::now(),
+        }) == crate::soloist::Readiness::Ready
     }
 
     /// Turns Soloist on and plays the song Spotify refused librespot through

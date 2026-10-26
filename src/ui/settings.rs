@@ -427,8 +427,7 @@ fn soloist_section(
 
     // The row that needs the listener next.
     let next = match readiness {
-        _ if expired => Some(SoloistStep::Program),
-        Readiness::NotFound | Readiness::ExpiringSoon { .. } => Some(SoloistStep::Program),
+        Readiness::NotFound | Readiness::Expired => Some(SoloistStep::Program),
         Readiness::NeedsKey => Some(SoloistStep::Key),
         _ if key_suspect => Some(SoloistStep::Key),
         _ => None,
@@ -481,28 +480,15 @@ fn soloist_section(
         && next != Some(SoloistStep::Program);
 
     let build_line = build.as_ref().map(|build| {
-        let days = crate::soloist::days_left(build, now);
-        if days < 0 {
+        if expired {
             // Translators: {version} is a version number, {date} the day it stopped working.
             gettext(locale, "{version} · expired {date}")
-                .replace("{version}", &build.version)
-                .replace("{date}", &date(build.expires()))
-        } else if days < crate::soloist::EXPIRY_WARNING_DAYS {
-            ngettext(
-                locale,
-                // Translators: {version} is a version number, {count} the days until it stops working.
-                "{version} · expires in {count} day",
-                "{version} · expires in {count} days",
-                days as u32,
-            )
-            .replace("{version}", &build.version)
-            .replace("{count}", &days.to_string())
         } else {
             // Translators: {version} is a version number, {date} the day it stops working.
             gettext(locale, "{version} · expires {date}")
-                .replace("{version}", &build.version)
-                .replace("{date}", &date(build.expires()))
         }
+        .replace("{version}", &build.version)
+        .replace("{date}", &date(build.expires()))
     });
     let program_detail = match (&app.soloist_downloaded, &found, build_line) {
         _ if downloading => String::new(),
@@ -550,9 +536,7 @@ fn soloist_section(
         Readiness::Checking if !downloading => None,
         _ if downloading => Some(gettext(locale, "Downloading…")),
         Readiness::NotFound => Some(gettext(locale, "Download from Spotify")),
-        Readiness::Expired | Readiness::ExpiringSoon { .. } => {
-            Some(gettext(locale, "Update from Spotify"))
-        }
+        Readiness::Expired => Some(gettext(locale, "Update from Spotify")),
         _ => Some(gettext(locale, "Check for an update")),
     };
     // Turning it on needs Soloist and its key; turning it off never waits.
