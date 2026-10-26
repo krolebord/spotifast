@@ -24,7 +24,7 @@ use futures_util::{SinkExt, StreamExt};
 use librespot_core::session::Session;
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::api::models::ArtistRef;
@@ -51,6 +51,14 @@ const PAIRING_POLL: Duration = Duration::from_secs(2);
 const DEVICE_ID_FILE: &str = ".device_id";
 /// Volume drags are forwarded at most this often.
 const PREVIEW_INTERVAL: Duration = Duration::from_millis(80);
+/// How long Soloist may take to acknowledge a command.
+const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+/// A seek Soloist has not carried out yet is sent again this often.
+const SEEK_RETRY: Duration = Duration::from_millis(500);
+/// How long a start partway into a song keeps seeking.
+const SEEK_PATIENCE: Duration = Duration::from_secs(15);
+/// How far from its target a reported position still counts as the seek.
+const SEEK_GRACE_MS: u32 = 3_000;
 
 /// Where Soloist lives and keeps its state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -658,6 +666,8 @@ pub struct Soloist {
     stop: watch::Sender<bool>,
     ended: watch::Receiver<bool>,
     last_preview: Mutex<Option<Instant>>,
+    /// The commands Soloist acknowledges, as it does.
+    acks: broadcast::Sender<String>,
 }
 
 impl Soloist {
@@ -774,6 +784,7 @@ impl Soloist {
         let (stop, mut stop_rx) = watch::channel(false);
         let (ended_tx, ended) = watch::channel(false);
         let (auth_tx, mut auth) = watch::channel(None::<bool>);
+        let (acks, _) = broadcast::channel(16);
 
         // Writer: commands from the engine, in order.
         tokio::spawn(async move {
@@ -795,6 +806,7 @@ impl Soloist {
         let reader_notify = Arc::clone(&shared_notify);
         let reader_ended = ended_tx.clone();
         let reader_commands = commands.clone();
+        let reader_acks = acks.clone();
         let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_elsewhere = Arc::clone(&elsewhere);
         tokio::spawn(async move {
@@ -820,6 +832,11 @@ impl Soloist {
                             .clone();
                         notify(EngineEvent::SoloistSignedIn);
                     }
+                }
+                if event["type"] == "command_result"
+                    && let Some(command) = event["command"].as_str()
+                {
+                    let _ = reader_acks.send(command.to_string());
                 }
                 if event["type"] == "error" {
                     log::warn!(
@@ -886,6 +903,7 @@ impl Soloist {
             stop,
             ended,
             last_preview: Mutex::new(None),
+            acks,
         };
         match soloist.sign_in(config, &mut auth).await {
             Ok((device_id, paired)) => {
@@ -1180,12 +1198,6 @@ impl Soloist {
             return;
         };
         log::warn!("Connect load for Soloist failed, playing over its API instead: {error:#}");
-        if let Some(shuffle) = spec.shuffle {
-            let _ = self.send("set_shuffle", json!({ "enabled": shuffle }));
-        }
-        if let Some(repeat) = spec.repeat {
-            let _ = self.set_repeat(repeat);
-        }
         let uri = spec
             .offset_uri
             .clone()
@@ -1194,12 +1206,75 @@ impl Soloist {
         let Some(uri) = uri else {
             return;
         };
+        // A bare play starts Soloist without making it Spotify's active
+        // device, and Spotify's apps would not know it plays.
+        self.activate().await;
+        if let Some(shuffle) = spec.shuffle {
+            let _ = self.send("set_shuffle", json!({ "enabled": shuffle }));
+        }
+        if let Some(repeat) = spec.repeat {
+            let _ = self.set_repeat(repeat);
+        }
         let _ = self.send("play", json!({ "uri": uri }));
         if spec.position_ms > 0 {
-            let _ = self.send("seek", json!({ "position_ms": spec.position_ms }));
+            // A context's first song is not known here: any song counts.
+            let song = matches!(crate::util::uri_kind(&uri), Some("track" | "episode"))
+                .then_some(uri.as_str());
+            self.seek_until_landed(spec.position_ms, song).await;
         }
         if !spec.play {
             let _ = self.send("pause", json!({}));
+        }
+    }
+
+    /// Makes Soloist Spotify's active device, and waits for Soloist to
+    /// acknowledge it before anything is played.
+    async fn activate(&self) {
+        let mut acks = self.acks.subscribe();
+        if self.send("activate", json!({})).is_err() {
+            return;
+        }
+        let acknowledged = tokio::time::timeout(ACK_TIMEOUT, async {
+            loop {
+                match acks.recv().await {
+                    Ok(command) if command == "activate" => return true,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if !acknowledged {
+            log::warn!("Soloist did not acknowledge becoming the active device; playing anyway");
+        }
+    }
+
+    /// Seeks to `position_ms` until Soloist reports playing there: it
+    /// drops a seek that arrives while the song is still loading. `song`
+    /// is the song the seek is for, when known.
+    async fn seek_until_landed(&self, position_ms: u32, song: Option<&str>) {
+        let started = Instant::now();
+        loop {
+            if self
+                .send("seek", json!({ "position_ms": position_ms }))
+                .is_err()
+            {
+                return;
+            }
+            tokio::time::sleep(SEEK_RETRY).await;
+            let waited = started.elapsed();
+            let landed = {
+                let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                seek_landed(&state, position_ms, song, waited)
+            };
+            if landed || self.has_ended() {
+                return;
+            }
+            if waited >= SEEK_PATIENCE {
+                log::warn!("Soloist did not seek to {position_ms} ms");
+                return;
+            }
         }
     }
 }
@@ -1676,6 +1751,28 @@ pub(crate) fn apply_event(state: &mut LocalState, event: &Value, now_ms: i64) ->
         ),
         _ => false,
     }
+}
+
+/// Whether `state` shows a seek to `target_ms` carried out, `waited`
+/// after it was first asked: `song`, when given, is playing, and its
+/// position is near the target, not still where an earlier song was.
+fn seek_landed(state: &LocalState, target_ms: u32, song: Option<&str>, waited: Duration) -> bool {
+    if state.loading {
+        return false;
+    }
+    let Some(track) = &state.track else {
+        return false;
+    };
+    if song.is_some_and(|song| track.uri != song) {
+        return false;
+    }
+    let position = state.position_now();
+    let waited = u32::try_from(waited.as_millis()).unwrap_or(u32::MAX);
+    position.saturating_add(SEEK_GRACE_MS) >= target_ms
+        && position
+            <= target_ms
+                .saturating_add(waited)
+                .saturating_add(SEEK_GRACE_MS)
 }
 
 /// Whether Spotify's `active` device is one other than Soloist's
@@ -2249,6 +2346,42 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[test]
+    fn a_seek_counts_once_its_song_reports_a_position_near_it() {
+        let song = "spotify:track:2JRo0gjbX4GrCqBYdRohoo";
+        let waited = Duration::from_secs(1);
+        let mut state = LocalState::default();
+        assert!(!seek_landed(&state, 90_000, None, waited), "nothing plays");
+        apply_event(&mut state, &track_event(), 0);
+        state.loading = true;
+        state.position_ms = 90_000;
+        assert!(
+            !seek_landed(&state, 90_000, Some(song), waited),
+            "still loading"
+        );
+        state.loading = false;
+        state.position_ms = 0;
+        assert!(
+            !seek_landed(&state, 90_000, Some(song), waited),
+            "the seek was dropped"
+        );
+        state.position_ms = 150_000;
+        assert!(
+            !seek_landed(&state, 90_000, Some(song), waited),
+            "still where an earlier play was"
+        );
+        state.position_ms = 89_500;
+        assert!(seek_landed(&state, 90_000, Some(song), waited));
+        assert!(
+            seek_landed(&state, 90_000, None, waited),
+            "a context's song"
+        );
+        assert!(
+            !seek_landed(&state, 90_000, Some("spotify:track:other"), waited),
+            "another song"
+        );
     }
 
     #[test]
