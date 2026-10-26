@@ -1804,7 +1804,7 @@ fn signal(pid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(pid, signal) == 0 }
 }
 
-/// Stops Soloist if this process ends wia_dir` from an earlier run,
+/// Stops a Soloist still running on `data_dir` from an earlier run,
 /// recognised by the pid file Soloist keeps there and its command line,
 /// so an unrelated process that reused the pid is left alone.
 #[cfg(unix)]
