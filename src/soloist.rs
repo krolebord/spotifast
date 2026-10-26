@@ -43,8 +43,12 @@ pub const BINARY: &str = if cfg!(windows) {
 const EXIT_EXPIRED: i32 = 10;
 /// How long Soloist may take to open its WebSocket port.
 const START_TIMEOUT: Duration = Duration::from_secs(20);
-/// How long a restored session may take to report itself logged in.
+/// How long Soloist may take to report itself logged in without a
+/// stored session, which a pick in Spotify's app may still bring.
 const RESTORE_WAIT: Duration = Duration::from_secs(4);
+/// How long a stored session may take to restore before Soloist is taken
+/// to need pairing again.
+const STORED_RESTORE_WAIT: Duration = Duration::from_secs(15);
 /// How often an unpaired Soloist is asked whether it has signed in.
 const PAIRING_POLL: Duration = Duration::from_secs(2);
 /// Where Soloist keeps its Connect device id, in its data directory.
@@ -705,7 +709,7 @@ impl Soloist {
         wait_for_last_started().await;
         // A Soloist a previous run left behind, after a crash or a kill,
         // holds the data directory's lock and its Connect device.
-        stop_stale(&config.data_dir).await;
+        stop_stale(&binary, &config.data_dir).await;
         let (data_dir, bitrate_kbps, normalisation) = (
             config.data_dir.clone(),
             config.bitrate_kbps,
@@ -756,6 +760,10 @@ impl Soloist {
         log::info!("starting Soloist from {}", binary.display());
         let mut child = command.spawn().context("unable to start Spotify Soloist")?;
         let pid = child.id();
+        // Closed with the supervisor below, or by Windows if this process
+        // dies first, which stops Soloist with it.
+        #[cfg(windows)]
+        let job = job::contain(&child);
         // Sent once the process has exited. A start that fails before the
         // supervisor takes the process on kills it and waits for it, then
         // drops this unsent: nothing is left to wait for.
@@ -818,6 +826,7 @@ impl Soloist {
         let reader_ended = ended_tx.clone();
         let reader_commands = commands.clone();
         let reader_acks = acks.clone();
+        let reader_said = said.clone();
         let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_elsewhere = Arc::clone(&elsewhere);
         tokio::spawn(async move {
@@ -858,6 +867,11 @@ impl Soloist {
                 // Sent under the lock, so snapshots reach the app in the
                 // order they were taken.
                 let mut current = reader_state.lock().unwrap_or_else(|p| p.into_inner());
+                // Under the lock with the error it clears, so a refusal
+                // printed meanwhile is shown again after both.
+                if event["type"] == "auth_state" && event["logged_in"] == true {
+                    reader_said.signed_in();
+                }
                 if apply_event_from(&mut current, &event, now_ms(), &reader_elsewhere) {
                     let notify = reader_notify
                         .lock()
@@ -871,11 +885,14 @@ impl Soloist {
 
         // Supervisor: the process, until it exits or the engine stops it.
         let supervisor_state = Arc::clone(&state);
+        let supervisor_said = said.clone();
         tokio::spawn(async move {
+            #[cfg(windows)]
+            let _job = job;
             tokio::select! {
                 status = child.wait() => {
                     let code = status.ok().and_then(|status| status.code());
-                    if let Some(message) = exit_message(code, said.refusal().await, false) {
+                    if let Some(message) = exit_message(code, supervisor_said.refusal().await, false) {
                         log::error!("{message}");
                         supervisor_state
                             .lock()
@@ -908,19 +925,27 @@ impl Soloist {
             last_preview: Mutex::new(None),
             acks,
         };
-        match soloist.sign_in(config, &mut auth).await {
+        match soloist.sign_in(config, &mut auth, &said).await {
             Ok((device_id, paired)) => {
                 soloist.device_id = device_id;
                 if !paired {
-                    // Soloist keeps waiting for a pick in Spotify's app; its
-                    // sign-in clears this. It does not always announce one,
-                    // so it is asked until it has signed in or stopped.
-                    let snapshot = {
+                    // Soloist keeps waiting for a pick in Spotify's app, or
+                    // for Spotify to take its key; its sign-in clears this.
+                    // It does not always announce one, so it is asked until
+                    // it has signed in or stopped.
+                    {
                         let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
-                        current.error = Some(pairing_needed(device_name));
-                        current.clone()
-                    };
-                    notify(EngineEvent::State(snapshot));
+                        // Checked, and sent, under the lock: a sign-in since
+                        // is told before the reader takes it to clear this.
+                        if *auth.borrow() != Some(true) {
+                            current.error = Some(if said.key_rejected() {
+                                key_rejected()
+                            } else {
+                                pairing_needed(device_name)
+                            });
+                            notify(EngineEvent::State(current.clone()));
+                        }
+                    }
                     let commands = soloist.commands.clone();
                     let mut auth = auth.clone();
                     tokio::spawn(async move {
@@ -935,6 +960,42 @@ impl Soloist {
                         }
                     });
                 }
+                // Spotify may refuse the key later, which Soloist only
+                // prints: it keeps running and reports nothing else.
+                let mut refusal = said.refusal.subscribe();
+                let refused_state = Arc::clone(&state);
+                let refused_notify = Arc::clone(&soloist.notify);
+                tokio::spawn(async move {
+                    loop {
+                        let rejected =
+                            |refusal: &Option<Refusal>| *refusal == Some(Refusal::KeyRejected);
+                        if refusal.wait_for(rejected).await.is_err() {
+                            return;
+                        }
+                        {
+                            let mut current =
+                                refused_state.lock().unwrap_or_else(|p| p.into_inner());
+                            // Checked again under the lock: a sign-in clears
+                            // the refusal before it takes the lock to clear
+                            // the error, so neither can undo the other.
+                            if rejected(&refusal.borrow())
+                                && set(&mut current.error, Some(key_rejected()))
+                            {
+                                log::warn!("Spotify refused Soloist's API key; it keeps running");
+                                let notify = refused_notify
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .clone();
+                                notify(EngineEvent::State(current.clone()));
+                            }
+                        }
+                        // Any change, not only a cleared one: a sign-in and
+                        // a new refusal may both land before this wakes.
+                        if refusal.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                });
                 Ok(soloist)
             }
             Err(error) => {
@@ -953,13 +1014,30 @@ impl Soloist {
         &self,
         config: &SoloistConfig,
         auth: &mut watch::Receiver<Option<bool>>,
+        said: &Said,
     ) -> Result<(String, bool)> {
-        let restored = tokio::time::timeout(
-            RESTORE_WAIT,
-            auth.wait_for(|logged_in| *logged_in == Some(true)),
-        )
+        let data_dir = config.data_dir.clone();
+        let stored = tokio::task::spawn_blocking(move || !accounts(&data_dir).is_empty())
+            .await
+            .unwrap_or(false);
+        // A stored session can take a while to restore, and asking for a
+        // pairing meanwhile would be wrong.
+        let wait = if stored {
+            STORED_RESTORE_WAIT
+        } else {
+            RESTORE_WAIT
+        };
+        let mut refusal = said.refusal.subscribe();
+        let restored = tokio::time::timeout(wait, async {
+            tokio::select! {
+                seen = auth.wait_for(|logged_in| *logged_in == Some(true)) => seen.is_ok(),
+                // Spotify refused the key and Soloist keeps running: no
+                // session is coming.
+                _ = refusal.wait_for(|refusal| *refusal == Some(Refusal::KeyRejected)) => false,
+            }
+        })
         .await
-        .is_ok_and(|seen| seen.is_ok());
+        .unwrap_or(false);
         if !restored && self.has_ended() {
             // It exited instead of waiting to be paired: Spotify refusing
             // the key for its stored session, most often.
@@ -1433,7 +1511,9 @@ fn refusal(line: &str) -> Option<Refusal> {
 /// What Soloist said about why it stopped, read from its output.
 #[derive(Clone)]
 struct Said {
-    refusal: Arc<Mutex<Option<Refusal>>>,
+    /// The last reason it gave. Soloist does not always exit after giving
+    /// one: it may refuse the key and keep running.
+    refusal: Arc<watch::Sender<Option<Refusal>>>,
     /// How many of its two output streams have closed.
     closed: Arc<watch::Sender<u8>>,
 }
@@ -1441,7 +1521,7 @@ struct Said {
 impl Said {
     fn new() -> Self {
         Self {
-            refusal: Arc::new(Mutex::new(None)),
+            refusal: Arc::new(watch::channel(None).0),
             closed: Arc::new(watch::channel(0).0),
         }
     }
@@ -1451,7 +1531,22 @@ impl Said {
     async fn refusal(&self) -> Option<Refusal> {
         let mut closed = self.closed.subscribe();
         let _ = tokio::time::timeout(OUTPUT_DRAIN, closed.wait_for(|closed| *closed >= 2)).await;
-        *self.refusal.lock().unwrap_or_else(|p| p.into_inner())
+        *self.refusal.borrow()
+    }
+
+    /// Whether the last reason it gave was a refused key.
+    fn key_rejected(&self) -> bool {
+        *self.refusal.borrow() == Some(Refusal::KeyRejected)
+    }
+
+    /// It signed in after all: an earlier refused key no longer explains
+    /// anything.
+    fn signed_in(&self) {
+        self.refusal.send_if_modified(|refusal| {
+            refusal
+                .take_if(|refusal| *refusal == Refusal::KeyRejected)
+                .is_some()
+        });
     }
 }
 
@@ -1465,9 +1560,7 @@ fn exit_message(code: Option<i32>, refusal: Option<Refusal>, starting: bool) -> 
             "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
                 .to_string()
         }
-        (_, Some(Refusal::KeyRejected)) => {
-            format!("{KEY_REJECTED} Check it in Settings, under Spotify Soloist.")
-        }
+        (_, Some(Refusal::KeyRejected)) => key_rejected(),
         (_, Some(Refusal::DataDirInUse)) => format!(
             "{EXITED_STARTING} (exit code {code_text}): another Soloist was still using its data folder."
         ),
@@ -1495,6 +1588,16 @@ async fn wait_for_last_started() {
     if let Some(mut last) = last {
         let _ = tokio::time::timeout(EXIT_WAIT, last.wait_for(|exited| *exited)).await;
     }
+}
+
+/// Whether `error` says what to fix before Soloist can sign in, which
+/// only its sign-in clears.
+fn is_setup_error(error: &str) -> bool {
+    error.starts_with(PAIRING_NEEDED) || error.starts_with(KEY_REJECTED)
+}
+
+fn key_rejected() -> String {
+    format!("{KEY_REJECTED} Check it in Settings, under Spotify Soloist.")
 }
 
 fn pairing_needed(device_name: &str) -> String {
@@ -1684,10 +1787,11 @@ fn watch_parent(soloist: u32) {
     }
 }
 
-/// Stops a Soloist still running on `data_dir` from an earlier run. It is
-/// recognised by the pid file Soloist keeps there and its command line,
-/// so an unrelated process that reused the pid is left alone.
-async fn stop_stale(data_dir: &Path) {
+/// Stops a Soloist still running on `data_dir` from an earlier run. On
+/// Unix it is recognised by the pid file Soloist keeps there and its
+/// command line, on Windows by `soloist ctl status`, so an unrelated
+/// process that reused the pid is left alone.
+async fn stop_stale(binary: &Path, data_dir: &Path) {
     #[cfg(unix)]
     {
         let Ok(text) = tokio::fs::read_to_string(data_dir.join("soloist.pid")).await else {
@@ -1721,8 +1825,122 @@ async fn stop_stale(data_dir: &Path) {
         signal(pid, libc::SIGKILL);
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    #[cfg(not(unix))]
-    let _ = data_dir;
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let Some(pid) = running_on(binary, data_dir).await else {
+            return;
+        };
+        log::warn!("stopping a Soloist left running by an earlier run (pid {pid})");
+        // Filtered by name too, so a process that reused the pid since is
+        // left alone.
+        let _ = tokio::process::Command::new("taskkill")
+            .arg("/F")
+            .arg("/FI")
+            .arg(format!("PID eq {pid}"))
+            .arg("/FI")
+            .arg(format!("IMAGENAME eq {BINARY}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .await;
+        for _ in 0..30 {
+            if running_on(binary, data_dir).await != Some(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    #[cfg(unix)]
+    let _ = binary;
+}
+
+/// The pid of the Soloist running on `data_dir`, as `soloist ctl status`
+/// reports it.
+#[cfg(windows)]
+async fn running_on(binary: &Path, data_dir: &Path) -> Option<u32> {
+    use std::process::Stdio;
+    let output = tokio::process::Command::new(binary)
+        .args(["ctl", "status", "-D"])
+        .arg(data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(3), output)
+        .await
+        .ok()?
+        .ok()?;
+    parse_ctl_status(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The pid in `soloist ctl status` output, "running (pid 1234)", while
+/// one runs.
+#[cfg(any(windows, test))]
+fn parse_ctl_status(text: &str) -> Option<u32> {
+    let rest = &text[text.find("running (pid ")? + "running (pid ".len()..];
+    rest[..rest.find(')')?].trim().parse().ok()
+}
+
+/// A Windows job that stops Soloist once its handle closes: when the
+/// supervisor lets go of it, or Windows does as this process dies.
+#[cfg(windows)]
+mod job {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    pub struct Job(HANDLE);
+
+    // SAFETY: a job handle is a kernel object handle, valid on any thread.
+    unsafe impl Send for Job {}
+
+    /// Puts `child` in a new job; None, with a warning, if Windows refuses.
+    pub fn contain(child: &tokio::process::Child) -> Option<Job> {
+        let process = child.raw_handle()?;
+        // SAFETY: plain Win32 calls on a new job handle, which `Job` owns
+        // and closes, and on our own child's live process handle.
+        let job = unsafe {
+            let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if handle.is_null() {
+                log::warn!("no job for Soloist: {}", std::io::Error::last_os_error());
+                return None;
+            }
+            let job = Job(handle);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let contained = SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) != 0
+                && AssignProcessToJobObject(handle, process) != 0;
+            if !contained {
+                log::warn!("no job for Soloist: {}", std::io::Error::last_os_error());
+                return None;
+            }
+            job
+        };
+        Some(job)
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateJobObjectW and is closed
+            // only here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
 }
 
 /// SPOTIFAST_SOLOIST_VERBOSE=1, or a diagnostic build, runs Soloist
@@ -1740,7 +1958,7 @@ async fn forward_log(output: impl tokio::io::AsyncRead + Unpin, key: String, sai
     while let Ok(Some(line)) = lines.next_line().await {
         let line = strip_ansi(&line.replace(&key, "[api key]"));
         if let Some(refusal) = refusal(&line) {
-            *said.refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(refusal);
+            said.refusal.send_replace(Some(refusal));
         }
         if verbose || !is_verbose_detail(&line) {
             log::info!("soloist: {line}");
@@ -1811,12 +2029,8 @@ pub(crate) fn apply_event(state: &mut LocalState, event: &Value, now_ms: i64) ->
     match event["type"].as_str().unwrap_or_default() {
         "auth_state" => {
             let mut changed = false;
-            if event["logged_in"] == true
-                && state
-                    .error
-                    .as_deref()
-                    .is_some_and(|error| error.starts_with(PAIRING_NEEDED))
-            {
+            // Signed in after all: paired, or Spotify took the key.
+            if event["logged_in"] == true && state.error.as_deref().is_some_and(is_setup_error) {
                 state.error = None;
                 changed = true;
             }
@@ -1861,6 +2075,9 @@ pub(crate) fn apply_event(state: &mut LocalState, event: &Value, now_ms: i64) ->
             .is_some_and(|volume| set(&mut state.volume, from_percent(volume))),
         "options_changed" => apply_options(state, &event["options"]),
         "position_sync" => apply_position(state, &event["position"], now_ms),
+        // Commands fail while it is not signed in; what to do about that
+        // stays shown over their errors.
+        "error" if state.error.as_deref().is_some_and(is_setup_error) => false,
         "error" => set(
             &mut state.error,
             Some(
@@ -2026,7 +2243,10 @@ fn apply_item(state: &mut LocalState, item: &Value) -> bool {
         .is_none_or(|previous| previous.uri != track.uri);
     state.track = Some(track);
     if new_song {
-        state.error = None;
+        // A song restored while it is not signed in solves nothing.
+        if !state.error.as_deref().is_some_and(is_setup_error) {
+            state.error = None;
+        }
         state.track_sequence = state.track_sequence.wrapping_add(1);
         state.position_ms = 0;
         if state.playback == Playback::Playing {
@@ -2290,6 +2510,48 @@ mod tests {
         assert!(LAST_STARTED.lock().unwrap().is_none());
     }
 
+    /// Soloist may refuse the key and keep running. A later sign-in
+    /// clears that, and only that.
+    #[test]
+    fn a_key_refused_while_running_lasts_until_soloist_signs_in() {
+        let said = Said::new();
+        said.refusal.send_replace(Some(Refusal::KeyRejected));
+        assert!(said.key_rejected());
+        said.signed_in();
+        assert!(!said.key_rejected());
+        said.refusal.send_replace(Some(Refusal::DataDirInUse));
+        said.signed_in();
+        assert_eq!(*said.refusal.borrow(), Some(Refusal::DataDirInUse));
+
+        let signed_in = json!({ "type": "auth_state", "logged_in": true });
+        let mut state = LocalState {
+            error: Some(key_rejected()),
+            ..LocalState::default()
+        };
+        // A command failing meanwhile does not hide what to fix.
+        let failed = json!({ "type": "error", "message": "command requires authentication" });
+        assert!(!apply_event(&mut state, &failed, 0));
+        assert_eq!(state.error, Some(key_rejected()));
+        // Nor does the song it restores.
+        assert!(apply_event(&mut state, &track_event(), 0));
+        assert_eq!(state.error, Some(key_rejected()));
+        assert!(apply_event(&mut state, &signed_in, 0));
+        assert_eq!(state.error, None);
+        let mut state = LocalState {
+            error: Some("Spotify Soloist stopped unexpectedly".into()),
+            ..LocalState::default()
+        };
+        assert!(!apply_event(&mut state, &signed_in, 0));
+        assert!(state.error.is_some());
+    }
+
+    #[test]
+    fn a_leftover_soloist_is_found_by_its_status() {
+        assert_eq!(parse_ctl_status("running (pid 17984)\n"), Some(17984));
+        assert_eq!(parse_ctl_status("not running\n"), None);
+        assert_eq!(parse_ctl_status("running (pid ?)"), None);
+    }
+
     /// The reason is read once both output streams have closed, so a last
     /// line that arrives just after the exit still counts.
     #[tokio::test(start_paused = true)]
@@ -2298,7 +2560,7 @@ mod tests {
         let late = said.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            *late.refusal.lock().unwrap() = Some(Refusal::DataDirInUse);
+            late.refusal.send_replace(Some(Refusal::DataDirInUse));
             late.closed.send_modify(|closed| *closed += 2);
         });
         assert_eq!(said.refusal().await, Some(Refusal::DataDirInUse));
