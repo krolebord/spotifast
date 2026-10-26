@@ -139,23 +139,10 @@ pub fn running(slot: &Slot) -> Option<Arc<Soloist>> {
     })
 }
 
-/// Names a Soloist executable to use instead of the downloaded one, for
-/// trying a particular build.
-pub const BINARY_ENV: &str = "SPOTIFAST_SOLOIST";
-
-/// The Soloist to run: `SPOTIFAST_SOLOIST` when set, else the newest build
-/// downloaded into `programs`. Only reads file metadata.
+/// The Soloist to run: the newest build downloaded into `programs`. Only
+/// reads file metadata.
 pub fn find_binary(programs: &Path) -> Option<PathBuf> {
-    match binary_override() {
-        Some(path) => path.is_file().then_some(path),
-        None => installed(programs).map(|(_, path)| path),
-    }
-}
-
-fn binary_override() -> Option<PathBuf> {
-    std::env::var_os(BINARY_ENV)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
+    installed(programs).map(|(_, path)| path)
 }
 
 /// Each downloaded build sits in a folder named for its build time, so a
@@ -465,8 +452,6 @@ pub fn accounts(data_dir: &Path) -> Vec<String> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Install {
     pub binary: Option<PathBuf>,
-    /// `binary` is the one `SPOTIFAST_SOLOIST` names, not a download.
-    pub overridden: bool,
     pub build: Option<Build>,
     pub accounts: Vec<String>,
     /// The API key file exists.
@@ -479,7 +464,6 @@ pub fn inspect(programs: &Path, data_dir: &Path, key_file: &Path) -> Install {
     let build = binary.as_deref().and_then(read_build);
     Install {
         binary,
-        overridden: binary_override().is_some(),
         build,
         accounts: accounts(data_dir),
         key_saved: key_file.is_file(),
@@ -2291,7 +2275,6 @@ mod tests {
         let day = jiff::SignedDuration::from_hours(24);
         let install = Install {
             binary: Some("/bin/soloist".into()),
-            overridden: false,
             build: Some(Build {
                 version: "1".into(),
                 built,
@@ -2680,7 +2663,7 @@ mod tests {
         assert!(downloaded.new);
         assert_eq!(downloaded.build.version, "1.3.10.13");
         let program = programs.join(built.to_string()).join(BINARY);
-        assert_eq!(find_binary_in(&programs), Some(program.clone()));
+        assert_eq!(find_binary(&programs), Some(program.clone()));
         assert!(
             !programs
                 .join(built.to_string())
@@ -2721,18 +2704,14 @@ mod tests {
         let downloaded = download(&client, &dir).unwrap();
         assert!(downloaded.new);
         assert_eq!(
-            read_build(&find_binary_in(&dir).unwrap()),
+            read_build(&find_binary(&dir).unwrap()),
             Some(downloaded.build)
         );
         // Asked again, the saved fingerprint spares the download.
-        let program = find_binary_in(&dir).unwrap();
+        let program = find_binary(&dir).unwrap();
         assert!(program.parent().unwrap().join(ETAG_FILE).is_file());
         assert!(!download(&client, &dir).unwrap().new);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn find_binary_in(programs: &Path) -> Option<PathBuf> {
-        installed(programs).map(|(_, path)| path)
     }
 
     fn track_event() -> Value {
