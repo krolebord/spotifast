@@ -810,7 +810,6 @@ fn transport(app: &mut App, ui: &mut egui::Ui, now: Option<&NowPlaying>, region:
     )
     .clicked()
     {
-        log::info!("player bar: Next clicked");
         app.actions.push(Action::Next);
     }
 

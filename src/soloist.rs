@@ -1190,12 +1190,7 @@ impl Soloist {
 
     /// Sends one command, with its fields, to Soloist's API.
     pub fn send(&self, command: &str, fields: Value) -> Result<()> {
-        // Volume drags send many; everything else is told at once.
-        if command == "set_volume" {
-            log::debug!("Soloist command: {command} {fields}");
-        } else {
-            log::info!("Soloist command: {command} {fields}");
-        }
+        log::debug!("Soloist command: {command} {fields}");
         let mut message = json!({ "type": "command", "command": command });
         if let (Some(message), Value::Object(fields)) = (message.as_object_mut(), fields) {
             message.extend(fields);
