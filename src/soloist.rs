@@ -1448,6 +1448,11 @@ fn load_body(spec: &LoadSpec) -> Value {
         overrides.insert("repeating_context".into(), json!(repeat != RepeatMode::Off));
         overrides.insert("repeating_track".into(), json!(repeat == RepeatMode::Track));
     }
+    // Smart Shuffle, which another of the account's apps may have left on,
+    // is off: Spotifast offers none, and Soloist asks for Liked Songs
+    // with Smart Shuffle's lens, which Spotify answers 404 and so plays
+    // nothing.
+    overrides.insert("modes".into(), json!({ "context_enhancement": "NONE" }));
     command["options"]["player_options_override"] = Value::Object(overrides);
     if !spec.play {
         command["options"]["initially_paused"] = json!(true);
@@ -3041,5 +3046,25 @@ mod tests {
             command["options"]["player_options_override"]["shuffling_context"],
             true
         );
+    }
+
+    /// Smart Shuffle left on by another app made Soloist ask for Liked
+    /// Songs in a form Spotify refuses, so every load turns it off.
+    #[test]
+    fn a_load_turns_smart_shuffle_off() {
+        for shuffle in [None, Some(false), Some(true)] {
+            let body = load_body(&LoadSpec {
+                context_uri: Some("spotify:user:me:collection".into()),
+                offset_uri: Some("spotify:track:2JRo0gjbX4GrCqBYdRohoo".into()),
+                play: true,
+                shuffle,
+                ..LoadSpec::default()
+            });
+            assert_eq!(
+                body["command"]["options"]["player_options_override"]["modes"],
+                json!({ "context_enhancement": "NONE" }),
+                "shuffle {shuffle:?}"
+            );
+        }
     }
 }
