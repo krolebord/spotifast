@@ -1119,13 +1119,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         RowText::new(
             gettext(locale, "Audio quality"),
             gettext(locale, "Higher bitrates use more data and cache space."),
-        )
-        .librespot_only(locale, soloist_plays),
+        ),
         RowText::new(
             normalize_volume.clone(),
             gettext(locale, "Keep loud and quiet tracks at a similar level."),
-        )
-        .librespot_only(locale, soloist_plays),
+        ),
         RowText::new(
             autoplay.clone(),
             gettext(locale, "Keep playing similar songs when your music ends."),

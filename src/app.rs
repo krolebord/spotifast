@@ -13619,6 +13619,8 @@ pub fn engine_config(
                 data_dir: dirs.soloist_data_dir(),
                 cache_dir: settings.audio_cache.then(|| dirs.soloist_cache_dir()),
                 cache_mb: settings.audio_cache.then_some(settings.audio_cache_mb),
+                bitrate_kbps: settings.bitrate,
+                normalisation: settings.normalisation,
             }
         }),
     }
