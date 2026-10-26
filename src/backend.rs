@@ -27,7 +27,8 @@ use crate::images::{ArtLoader, art_palette};
 use crate::model::{PlaylistCache, TopPeriod};
 use crate::paths::AppDirs;
 use crate::player::{
-    Engine, EngineConfig, EngineEvent, Heard, KeptPlayer, LocalState, PlaybackResume, PlayerCommand,
+    Engine, EngineConfig, EngineEvent, Heard, KeptPlayer, LoadSpec, LocalState, PlaybackResume,
+    PlayerCommand,
 };
 use crate::session_reads;
 use crate::settings::ProxyConfig;
@@ -865,6 +866,11 @@ pub enum Command {
     },
     /// Check that a reconnect's pickup really started, and try again if not.
     VerifyResume,
+    /// Send the load held while the engine reconnected (`Worker::held_load`)
+    /// to the engine this connection attempt brought.
+    SendHeldLoad {
+        attempt: u64,
+    },
     /// Add, replace, or remove the optional personal Web API application.
     ConfigurePersonalWebApp(Option<String>),
     /// Read a playlist's cached items from disk.
@@ -1914,6 +1920,9 @@ struct Worker {
     /// The Soloist that plays across engines while it is the chosen
     /// output: librespot reconnects without stopping it.
     soloist: crate::soloist::Slot,
+    /// The latest load asked while the engine reconnected with Soloist
+    /// playing on: a load goes over Connect, so it waits for the engine.
+    held_load: Option<LoadSpec>,
     network_reachable: bool,
     waiting_for_network: bool,
     engine_attempt: u64,
@@ -2016,6 +2025,7 @@ impl Worker {
             resume_verify: None,
             kept_player: None,
             soloist: crate::soloist::Slot::default(),
+            held_load: None,
             network_reachable: true,
             waiting_for_network: false,
             engine_attempt: 0,
@@ -2439,6 +2449,7 @@ impl Worker {
                 Command::Player(command) => {
                     if matches!(&command, PlayerCommand::Load(_)) {
                         self.resume = None;
+                        self.held_load = None;
                     }
                     match &self.engine {
                         // Until the new session picks the song up, it has
@@ -2461,9 +2472,11 @@ impl Worker {
                                 // Something else chosen: the old song stops.
                                 self.stop_kept_player();
                             }
-                            self.emit(Event::Error(
-                                "Local playback isn't set up on this computer yet".into(),
-                            ))
+                            if !self.command_soloist_between_engines(command) {
+                                self.emit(Event::Error(
+                                    "Local playback isn't set up on this computer yet".into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2730,6 +2743,7 @@ impl Worker {
                     self.on_rootlist_finished(generation, result);
                 }
                 Command::VerifyResume => self.verify_resume(),
+                Command::SendHeldLoad { attempt } => self.send_held_load(attempt),
                 Command::LoadPlaylistCache { id, generation } => {
                     self.load_playlist_cache(id, generation)
                 }
@@ -3517,6 +3531,7 @@ impl Worker {
             engine.shutdown();
         }
         crate::soloist::stop_slot(&self.soloist);
+        self.held_load = None;
         self.stop_kept_player();
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
@@ -3650,6 +3665,7 @@ impl Worker {
         if session_drops_exhausted(&mut self.reconnects, now) {
             self.take_engine_for_resume();
             self.resume = None;
+            self.held_load = None;
             self.emit(Event::Playback(LocalPlayback::Failed(
                 "Local playback keeps dropping. Re-enable it from Settings.".into(),
             )));
@@ -3724,6 +3740,48 @@ impl Worker {
     /// playback, and the level being heard. A session that drops on its own
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
+    /// While the engine reconnects, Soloist plays on and its own API still
+    /// answers: what that API can do goes to it now. A load needs Connect,
+    /// so the latest one waits for the engine. False when no Soloist runs
+    /// to take the command, or it is a queue edit.
+    fn command_soloist_between_engines(&mut self, command: PlayerCommand) -> bool {
+        if self.engine_config.soloist.is_none() {
+            return false;
+        }
+        let Some(soloist) = crate::soloist::running(&self.soloist) else {
+            return false;
+        };
+        if let Some(result) = crate::player::soloist_api_command(&soloist, &command) {
+            if let Err(error) = result {
+                self.emit(Event::Error(format!("Playback error: {error}")));
+            }
+            return true;
+        }
+        match command {
+            PlayerCommand::Load(spec) => {
+                self.held_load = Some(spec);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Sends the held load, if the engine `attempt` brought is still the
+    /// one: an engine that dropped since leaves it for the next.
+    fn send_held_load(&mut self, attempt: u64) {
+        if attempt != self.engine_attempt {
+            return;
+        }
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        if let Some(spec) = self.held_load.take()
+            && let Err(error) = engine.command(PlayerCommand::Load(spec))
+        {
+            self.emit(Event::Error(format!("Playback error: {error}")));
+        }
+    }
+
     fn take_engine_for_resume(&mut self) {
         self.stop_kept_player();
         self.resume_verify = None;
@@ -4045,6 +4103,16 @@ impl Worker {
                     self.schedule_resume_check(1_500);
                 }
                 self.engine = Some(engine);
+                if self.held_load.is_some() {
+                    // As with a resume, Connect turns a load down while the
+                    // new session is still registering.
+                    let commands = self.commands.clone();
+                    let attempt = self.engine_attempt;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1_500)).await;
+                        let _ = commands.send(Command::SendHeldLoad { attempt });
+                    });
+                }
                 self.start_rootlist();
                 self.reconnects.clear();
                 self.emit(Event::Playback(LocalPlayback::Ready { device_id }));
@@ -4066,6 +4134,7 @@ impl Worker {
                     if session_drops_exhausted(&mut self.reconnects, now) {
                         self.pending_playback_grant = None;
                         self.resume = None;
+                        self.held_load = None;
                         self.stop_kept_player();
                         let message = "Local playback keeps dropping. Re-enable it from Settings.";
                         self.fail_waiting_prerelease(message);
@@ -4122,6 +4191,7 @@ impl Worker {
                 engine.shutdown();
             }
             crate::soloist::stop_slot(&self.soloist);
+            self.held_load = None;
             self.stop_kept_player();
             self.pending_playback_grant = None;
             let credential_stored = self.playback_grant.is_some();
@@ -9735,6 +9805,149 @@ mod cover_routing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker whose engine is away while a Soloist, with nothing behind
+    /// it, plays on in the slot.
+    fn worker_with_soloist(
+        name: &str,
+    ) -> (
+        tokio::runtime::Runtime,
+        Worker,
+        std::sync::mpsc::Receiver<Event>,
+        mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let (runtime, mut worker, events) = super::authorization_tests::worker(name);
+        let config = crate::soloist::SoloistConfig {
+            programs: "programs".into(),
+            key_file: "key".into(),
+            data_dir: "data".into(),
+            cache_dir: None,
+            cache_mb: None,
+            bitrate_kbps: 160,
+            normalisation: false,
+        };
+        worker.engine_config.soloist = Some(config.clone());
+        let state = LocalState {
+            playback: crate::player::Playback::Playing,
+            ..LocalState::default()
+        };
+        let (soloist, sent) = crate::soloist::Soloist::detached(state);
+        *worker.soloist.try_lock().unwrap() = Some(crate::soloist::Running {
+            config,
+            device_name: "Spotifast (soloist)".into(),
+            soloist,
+        });
+        (runtime, worker, events, sent)
+    }
+
+    fn run_commands(runtime: &tokio::runtime::Runtime, worker: &mut Worker, sent: Vec<Command>) {
+        let (commands, receiver) = mpsc::unbounded_channel();
+        for command in sent {
+            commands.send(command).unwrap();
+        }
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+    }
+
+    /// librespot reconnecting leaves Soloist playing: what its own API can
+    /// do still reaches it, with no error for each step of a volume drag.
+    #[test]
+    fn soloist_takes_its_controls_while_the_engine_reconnects() {
+        let (runtime, mut worker, events, mut sent) = worker_with_soloist("soloist-controls");
+        run_commands(
+            &runtime,
+            &mut worker,
+            vec![
+                Command::Player(PlayerCommand::VolumePreview(20_000)),
+                Command::Player(PlayerCommand::Volume(30_000)),
+                Command::Player(PlayerCommand::Toggle),
+                Command::Player(PlayerCommand::Next),
+                Command::Player(PlayerCommand::Seek(5_000)),
+                Command::Player(PlayerCommand::Shuffle(true)),
+            ],
+        );
+        let names: Vec<String> = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|command| command["command"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "set_volume",
+                "set_volume",
+                "pause",
+                "skip_next",
+                "seek",
+                "set_shuffle"
+            ]
+        );
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+    }
+
+    /// A load needs Connect: the latest one waits for the engine, and a
+    /// queue edit, which cannot wait in order with it, still fails.
+    #[test]
+    fn the_latest_load_waits_for_the_engine() {
+        let (runtime, mut worker, events, _sent) = worker_with_soloist("soloist-held-load");
+        let song = |uri: &str| LoadSpec {
+            context_uri: Some("spotify:playlist:p".into()),
+            offset_uri: Some(uri.into()),
+            play: true,
+            ..LoadSpec::default()
+        };
+        run_commands(
+            &runtime,
+            &mut worker,
+            vec![
+                Command::Player(PlayerCommand::Load(song("spotify:track:a"))),
+                Command::Player(PlayerCommand::AddToQueue("spotify:track:q".into())),
+                Command::Player(PlayerCommand::Load(song("spotify:track:b"))),
+            ],
+        );
+        assert_eq!(worker.held_load, Some(song("spotify:track:b")));
+        let errors = events
+            .try_iter()
+            .filter(|event| matches!(event, Event::Error(_)))
+            .count();
+        assert_eq!(errors, 1, "only the queue edit fails");
+    }
+
+    /// The held load waits for the engine its connection attempt brought:
+    /// not sent without one, nor by an attempt that dropped since.
+    #[test]
+    fn a_held_load_stays_until_its_engine_is_there() {
+        let (_runtime, mut worker, _events) =
+            super::authorization_tests::worker("held-load-engine");
+        let spec = LoadSpec {
+            context_uri: Some("spotify:playlist:p".into()),
+            play: true,
+            ..LoadSpec::default()
+        };
+        worker.held_load = Some(spec.clone());
+        worker.send_held_load(worker.engine_attempt);
+        assert_eq!(worker.held_load, Some(spec.clone()));
+        worker.send_held_load(worker.engine_attempt.wrapping_add(1));
+        assert_eq!(worker.held_load, Some(spec));
+    }
+
+    /// With no Soloist running, there is still nothing to play on.
+    #[test]
+    fn without_soloist_a_command_between_engines_still_fails() {
+        let (runtime, mut worker, events) =
+            super::authorization_tests::worker("no-soloist-between-engines");
+        run_commands(
+            &runtime,
+            &mut worker,
+            vec![Command::Player(PlayerCommand::Volume(30_000))],
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Error(message) if message.contains("isn't set up")
+        )));
+    }
 
     /// Avoids shared playlist search after a successful session read.
     #[tokio::test]
