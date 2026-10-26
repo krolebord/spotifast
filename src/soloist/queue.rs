@@ -123,7 +123,7 @@ impl Remote {
         let state = self.state()?;
         let want = desired(&queued_uris(&state), ops);
         let adds = missing(&queued_uris(&state), &want);
-        log::info!(
+        log::debug!(
             "Soloist queue: {} commands leave {} songs queued; {} queued now, {} to add",
             ops.len(),
             want.len(),
@@ -131,7 +131,7 @@ impl Remote {
             adds.len()
         );
         for uri in &adds {
-            log::info!("Soloist queue: add_to_queue {uri}");
+            log::debug!("Soloist queue: add_to_queue {uri}");
             let revision = self.revision();
             self.command(&json!({
                 "command": { "endpoint": "add_to_queue", "track": { "uri": uri } }
@@ -152,7 +152,7 @@ impl Remote {
             let Some(body) = set_queue(&state, &want) else {
                 return Ok(());
             };
-            log::info!(
+            log::debug!(
                 "Soloist queue: set_queue with {} next and {} previous songs at revision {}",
                 state.next_tracks.len(),
                 state.prev_tracks.len(),
