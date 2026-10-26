@@ -582,10 +582,9 @@ pub fn is_pairing_needed(error: &str) -> bool {
     error.starts_with(PAIRING_NEEDED)
 }
 
-/// Whether an engine error is Soloist exiting before it opened its API,
-/// which is how it answers a key Spotify does not accept.
+/// Whether an engine error is Soloist saying Spotify refused its key.
 pub fn is_key_suspect(error: &str) -> bool {
-    error.starts_with(EXITED_STARTING)
+    error.starts_with(KEY_REJECTED)
 }
 
 /// What the Soloist that playback goes through is doing, as far as the
@@ -665,6 +664,9 @@ pub struct Soloist {
     device_id: String,
     stop: watch::Sender<bool>,
     ended: watch::Receiver<bool>,
+    /// Set once the process has exited, which `ended` may come before:
+    /// Soloist closes its API first and lets go of its data directory last.
+    exited: watch::Receiver<bool>,
     last_preview: Mutex<Option<Instant>>,
     /// The commands Soloist acknowledges, as it does.
     acks: broadcast::Sender<String>,
@@ -698,6 +700,9 @@ impl Soloist {
         // Left behind by a Soloist that did not shut down cleanly.
         let _ = tokio::fs::remove_file(&addr_file).await;
         let _ = tokio::fs::remove_file(&port_file).await;
+        // The Soloist this run started last, stopped just now to make way
+        // for this one, may still be shutting down.
+        wait_for_last_started().await;
         // A Soloist a previous run left behind, after a crash or a kill,
         // holds the data directory's lock and its Connect device.
         stop_stale(&config.data_dir).await;
@@ -751,22 +756,28 @@ impl Soloist {
         log::info!("starting Soloist from {}", binary.display());
         let mut child = command.spawn().context("unable to start Spotify Soloist")?;
         let pid = child.id();
+        // Sent once the process has exited. A start that fails before the
+        // supervisor takes the process on kills it and waits for it, then
+        // drops this unsent: nothing is left to wait for.
+        let (exited_tx, exited) = watch::channel(false);
+        *LAST_STARTED.lock().unwrap_or_else(|p| p.into_inner()) = Some(exited.clone());
         #[cfg(unix)]
         if let Some(pid) = pid {
             watch_parent(pid);
         }
+        let said = Said::new();
         if let Some(out) = child.stdout.take() {
-            tokio::spawn(forward_log(out, key.clone()));
+            tokio::spawn(forward_log(out, key.clone(), said.clone()));
         }
         if let Some(err) = child.stderr.take() {
-            tokio::spawn(forward_log(err, key.clone()));
+            tokio::spawn(forward_log(err, key.clone(), said.clone()));
         }
         drop(key);
 
-        let port = match wait_for_port(&mut child, &port_file).await {
+        let port = match wait_for_port(&mut child, &port_file, &said).await {
             Ok(port) => port,
             Err(error) => {
-                let _ = child.start_kill();
+                let _ = child.kill().await;
                 return Err(error);
             }
         };
@@ -774,7 +785,7 @@ impl Soloist {
         let (socket, _) = match tokio_tungstenite::connect_async(url.as_str()).await {
             Ok(connected) => connected,
             Err(error) => {
-                let _ = child.start_kill();
+                let _ = child.kill().await;
                 return Err(anyhow!("unable to reach Soloist's local API: {error}"));
             }
         };
@@ -863,18 +874,8 @@ impl Soloist {
         tokio::spawn(async move {
             tokio::select! {
                 status = child.wait() => {
-                    let message = match status.ok().and_then(|status| status.code()) {
-                        Some(EXIT_EXPIRED) => Some(
-                            "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
-                                .to_string(),
-                        ),
-                        Some(0) => None,
-                        code => Some(format!(
-                            "Spotify Soloist stopped unexpectedly (exit code {}). See the log for details.",
-                            code.map_or_else(|| "none".into(), |code| code.to_string())
-                        )),
-                    };
-                    if let Some(message) = message {
+                    let code = status.ok().and_then(|status| status.code());
+                    if let Some(message) = exit_message(code, said.refusal().await, false) {
                         log::error!("{message}");
                         supervisor_state
                             .lock()
@@ -888,6 +889,7 @@ impl Soloist {
                     terminate(&mut child).await;
                 }
             }
+            let _ = exited_tx.send(true);
             let _ = ended_tx.send(true);
         });
 
@@ -902,6 +904,7 @@ impl Soloist {
             device_id: String::new(),
             stop,
             ended,
+            exited,
             last_preview: Mutex::new(None),
             acks,
         };
@@ -957,6 +960,18 @@ impl Soloist {
         )
         .await
         .is_ok_and(|seen| seen.is_ok());
+        if !restored && self.has_ended() {
+            // It exited instead of waiting to be paired: Spotify refusing
+            // the key for its stored session, most often.
+            let _ = tokio::time::timeout(EXIT_WAIT, self.exited()).await;
+            let error = self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .error
+                .clone();
+            bail!(error.unwrap_or_else(|| format!("{EXITED_STARTING}. See the log for details.")));
+        }
         // Soloist writes its Connect identity next to its stored session.
         let device_id = read_device_id(&config.data_dir).await;
         if !restored {
@@ -980,6 +995,13 @@ impl Soloist {
     pub async fn ended(&self) {
         let mut ended = self.ended.clone();
         let _ = ended.wait_for(|ended| *ended).await;
+    }
+
+    /// Resolves once the process has exited and let go of its data
+    /// directory.
+    pub async fn exited(&self) {
+        let mut exited = self.exited.clone();
+        let _ = exited.wait_for(|exited| *exited).await;
     }
 
     /// Whether Soloist has exited or its API connection closed.
@@ -1378,6 +1400,102 @@ const CLAIM: Duration = Duration::from_secs(10);
 const PAIRING_NEEDED: &str = "Soloist is waiting to be paired.";
 /// The start of the message shown when Soloist exits before it is ready.
 const EXITED_STARTING: &str = "Spotify Soloist exited while starting";
+/// The start of the message shown when Soloist says Spotify refused its key.
+const KEY_REJECTED: &str = "Spotify rejected the Soloist API key.";
+/// How long the end of Soloist's output may take to arrive after it exits.
+const OUTPUT_DRAIN: Duration = Duration::from_secs(1);
+/// How long a stopped Soloist may take to exit: `terminate` waits three
+/// seconds before it kills.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// A reason Soloist gives on its way out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Spotify did not accept the API key, or there was none.
+    KeyRejected,
+    /// Another Soloist still holds the data directory's lock.
+    DataDirInUse,
+}
+
+/// The reason in one line of Soloist's output, if it gives one.
+fn refusal(line: &str) -> Option<Refusal> {
+    if line.contains("another session is running for data directory") {
+        Some(Refusal::DataDirInUse)
+    } else if line.contains("make sure --api-key is valid")
+        || line.contains("--api-key is required")
+    {
+        Some(Refusal::KeyRejected)
+    } else {
+        None
+    }
+}
+
+/// What Soloist said about why it stopped, read from its output.
+#[derive(Clone)]
+struct Said {
+    refusal: Arc<Mutex<Option<Refusal>>>,
+    /// How many of its two output streams have closed.
+    closed: Arc<watch::Sender<u8>>,
+}
+
+impl Said {
+    fn new() -> Self {
+        Self {
+            refusal: Arc::new(Mutex::new(None)),
+            closed: Arc::new(watch::channel(0).0),
+        }
+    }
+
+    /// The reason it gave, once its output has ended. The process has
+    /// exited by now, but its last lines may still be on their way.
+    async fn refusal(&self) -> Option<Refusal> {
+        let mut closed = self.closed.subscribe();
+        let _ = tokio::time::timeout(OUTPUT_DRAIN, closed.wait_for(|closed| *closed >= 2)).await;
+        *self.refusal.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// What to tell the listener about Soloist exiting with `code`, having
+/// given `refusal`; `starting` until it has signed in. None for a clean
+/// exit after it ran.
+fn exit_message(code: Option<i32>, refusal: Option<Refusal>, starting: bool) -> Option<String> {
+    let code_text = code.map_or_else(|| "none".into(), |code| code.to_string());
+    Some(match (code, refusal) {
+        (Some(EXIT_EXPIRED), _) => {
+            "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
+                .to_string()
+        }
+        (_, Some(Refusal::KeyRejected)) => {
+            format!("{KEY_REJECTED} Check it in Settings, under Spotify Soloist.")
+        }
+        (_, Some(Refusal::DataDirInUse)) => format!(
+            "{EXITED_STARTING} (exit code {code_text}): another Soloist was still using its data folder."
+        ),
+        (Some(0), None) if !starting => return None,
+        _ if starting => {
+            format!("{EXITED_STARTING} (exit code {code_text}). See the log for details.")
+        }
+        _ => format!(
+            "Spotify Soloist stopped unexpectedly (exit code {code_text}). See the log for details."
+        ),
+    })
+}
+
+/// The Soloist started last, until its process has exited. A new one
+/// waits for it: Soloist locks its data directory, and one started while
+/// the last still holds the lock exits at once.
+static LAST_STARTED: Mutex<Option<watch::Receiver<bool>>> = Mutex::new(None);
+
+/// Waits, for at most `EXIT_WAIT`, until the Soloist started last exits.
+async fn wait_for_last_started() {
+    let last = LAST_STARTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take();
+    if let Some(mut last) = last {
+        let _ = tokio::time::timeout(EXIT_WAIT, last.wait_for(|exited| *exited)).await;
+    }
+}
 
 fn pairing_needed(device_name: &str) -> String {
     format!(
@@ -1488,19 +1606,17 @@ fn runtime_files(data_dir: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// Waits for Soloist to write the port its API listens on.
-async fn wait_for_port(child: &mut tokio::process::Child, port_file: &Path) -> Result<u16> {
+async fn wait_for_port(
+    child: &mut tokio::process::Child,
+    port_file: &Path,
+    said: &Said,
+) -> Result<u16> {
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Err(match status.code() {
-                Some(EXIT_EXPIRED) => anyhow!(
-                    "This Spotify Soloist build has expired. Update it in Settings, under Spotify Soloist."
-                ),
-                code => anyhow!(
-                    "{EXITED_STARTING} (exit code {}). Check its API key; the log has details.",
-                    code.map_or_else(|| "none".into(), |code| code.to_string())
-                ),
-            });
+            let message = exit_message(status.code(), said.refusal().await, true)
+                .unwrap_or_else(|| format!("{EXITED_STARTING}. See the log for details."));
+            return Err(anyhow!(message));
         }
         if let Ok(text) = tokio::fs::read_to_string(port_file).await
             && let Ok(port) = text.trim().parse::<u16>()
@@ -1616,16 +1732,21 @@ fn verbose() -> bool {
 }
 
 /// Soloist's output goes to the log, with the API key masked and detail
-/// below warning level left out.
-async fn forward_log(output: impl tokio::io::AsyncRead + Unpin, key: String) {
+/// below warning level left out. A reason it gives for stopping goes to
+/// `said`.
+async fn forward_log(output: impl tokio::io::AsyncRead + Unpin, key: String, said: Said) {
     let verbose = verbose();
     let mut lines = tokio::io::BufReader::new(output).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let line = strip_ansi(&line.replace(&key, "[api key]"));
+        if let Some(refusal) = refusal(&line) {
+            *said.refusal.lock().unwrap_or_else(|p| p.into_inner()) = Some(refusal);
+        }
         if verbose || !is_verbose_detail(&line) {
             log::info!("soloist: {line}");
         }
     }
+    said.closed.send_modify(|closed| *closed += 1);
 }
 
 /// The line without terminal colour codes.
@@ -2082,13 +2203,110 @@ mod tests {
             ),
             Status::Failed("Spotify Soloist stopped unexpectedly".into())
         );
-        let exited = format!("{EXITED_STARTING} (exit code 1). Check its API key.");
+        let rejected = exit_message(Some(1), Some(Refusal::KeyRejected), true).unwrap();
         assert_eq!(
-            status(true, false, &LocalPlayback::Failed(exited.clone()), None),
-            Status::Failed(exited.clone())
+            status(true, false, &LocalPlayback::Failed(rejected.clone()), None),
+            Status::Failed(rejected.clone())
         );
-        assert!(is_key_suspect(&exited));
+        assert!(is_key_suspect(&rejected));
         assert!(!is_key_suspect("Spotify Soloist stopped unexpectedly"));
+        let exited = exit_message(Some(1), None, true).unwrap();
+        assert!(!is_key_suspect(&exited));
+    }
+
+    /// Only what Soloist says about its key points at the key: exiting
+    /// because another Soloist holds the data folder does not.
+    #[test]
+    fn an_exit_is_explained_by_what_soloist_said() {
+        assert_eq!(
+            refusal("Error: another session is running for data directory \"/data/soloist\"."),
+            Some(Refusal::DataDirInUse)
+        );
+        assert_eq!(
+            refusal("2026-10-26 13:15:04.404: login failed: make sure --api-key is valid"),
+            Some(Refusal::KeyRejected)
+        );
+        assert_eq!(
+            refusal("Error: --api-key is required"),
+            Some(Refusal::KeyRejected)
+        );
+        assert_eq!(refusal("2026-10-26 13:15:04.357: shutting down"), None);
+        // Logged for one login attempt, not on the way out: a later exit
+        // for another reason must not blame the key.
+        assert_eq!(
+            refusal("login failed while API key is configured (action_id=7)"),
+            None
+        );
+
+        let in_use = exit_message(Some(1), Some(Refusal::DataDirInUse), true).unwrap();
+        assert!(in_use.starts_with(EXITED_STARTING));
+        assert!(in_use.contains("another Soloist"));
+        assert!(!in_use.contains("API key"));
+        assert!(!is_key_suspect(&in_use));
+
+        let unexplained = exit_message(Some(1), None, true).unwrap();
+        assert!(!unexplained.contains("API key"));
+
+        // A stored session Spotify refuses ends Soloist after it ran.
+        let refused = exit_message(Some(1), Some(Refusal::KeyRejected), false).unwrap();
+        assert!(is_key_suspect(&refused));
+        assert_eq!(exit_message(Some(0), None, false), None);
+        assert!(exit_message(Some(0), None, true).is_some());
+        assert!(
+            exit_message(Some(EXIT_EXPIRED), Some(Refusal::KeyRejected), true)
+                .unwrap()
+                .contains("expired")
+        );
+    }
+
+    /// A new Soloist waits for the one stopped to make way for it: Soloist
+    /// locks its data folder until its process has gone, and a settings
+    /// change used to start the next one before then.
+    #[tokio::test(start_paused = true)]
+    async fn the_next_soloist_waits_for_the_last_to_exit() {
+        let (exited_tx, exited) = watch::channel(false);
+        *LAST_STARTED.lock().unwrap() = Some(exited);
+        let wait = tokio::spawn(wait_for_last_started());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!wait.is_finished());
+        exited_tx.send(true).unwrap();
+        wait.await.unwrap();
+
+        // One killed before the supervisor took it on leaves nothing to
+        // wait for.
+        let (exited_tx, exited) = watch::channel(false);
+        *LAST_STARTED.lock().unwrap() = Some(exited);
+        drop(exited_tx);
+        let started = tokio::time::Instant::now();
+        wait_for_last_started().await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // One that never exits holds the next up only so long.
+        let (_exited_tx, exited) = watch::channel(false);
+        *LAST_STARTED.lock().unwrap() = Some(exited);
+        let started = tokio::time::Instant::now();
+        wait_for_last_started().await;
+        assert_eq!(started.elapsed(), EXIT_WAIT);
+        assert!(LAST_STARTED.lock().unwrap().is_none());
+    }
+
+    /// The reason is read once both output streams have closed, so a last
+    /// line that arrives just after the exit still counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_reason_waits_for_the_output_to_end() {
+        let said = Said::new();
+        let late = said.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            *late.refusal.lock().unwrap() = Some(Refusal::DataDirInUse);
+            late.closed.send_modify(|closed| *closed += 2);
+        });
+        assert_eq!(said.refusal().await, Some(Refusal::DataDirInUse));
+
+        // Output that never closes holds it up only briefly.
+        let started = tokio::time::Instant::now();
+        assert_eq!(Said::new().refusal().await, None);
+        assert!(started.elapsed() >= OUTPUT_DRAIN);
     }
 
     #[test]

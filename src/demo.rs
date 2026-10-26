@@ -6431,8 +6431,9 @@ mod tests {
         );
     }
 
-    /// What goes wrong with Soloist shows on its switch: a start that
-    /// points at the key, a stop, and a build about to expire.
+    /// What goes wrong with Soloist shows on its switch: a start Spotify
+    /// refused the key for, one that failed for another reason, a stop,
+    /// and a build about to expire.
     #[test]
     fn soloist_failures_show_in_its_section() {
         let (ctx, mut app) = accessible_app("soloist-failures");
@@ -6440,8 +6441,9 @@ mod tests {
         let me = app.user_id().unwrap_or("someone").to_string();
         app.soloist_install = Some(soloist_install(10, &[&me], true));
         app.settings.soloist = crate::settings::SoloistUse::Always;
-        let exited = "Spotify Soloist exited while starting (exit code 1). Check its API key; the log has details.";
-        app.local_playback = crate::backend::LocalPlayback::Failed(exited.into());
+        let rejected =
+            "Spotify rejected the Soloist API key. Check it in Settings, under Spotify Soloist.";
+        app.local_playback = crate::backend::LocalPlayback::Failed(rejected.into());
         let painted = soloist_painted(&ctx, &mut app);
         sidebar_text(
             &painted,
@@ -6450,6 +6452,14 @@ mod tests {
         sidebar_text(&painted, "Try again");
         sidebar_text(&painted, "Spotify may have rejected it.");
         sidebar_text(&painted, "Save key");
+
+        // Exiting for another reason does not blame the key.
+        let in_use = "Spotify Soloist exited while starting (exit code 1): another Soloist was still using its data folder.";
+        app.local_playback = crate::backend::LocalPlayback::Failed(in_use.into());
+        let painted = soloist_painted(&ctx, &mut app);
+        sidebar_text(&painted, in_use);
+        sidebar_text(&painted, "Try again");
+        sidebar_text(&painted, "Saved.");
 
         app.local_playback = crate::backend::LocalPlayback::Ready {
             device_id: "soloist".into(),
