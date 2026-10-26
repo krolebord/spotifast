@@ -6186,7 +6186,7 @@ mod tests {
         let (ctx, mut app) = accessible_app("soloist-greys-librespot");
         app.open(Page::Settings);
         app.settings.soloist = crate::settings::SoloistUse::Always;
-        let normalisation = app.settings.normalisation;
+        let gapless = app.settings.gapless;
         let shows = |tree: &egui::accesskit::TreeUpdate, text: &str| {
             tree.nodes
                 .iter()
@@ -6197,16 +6197,16 @@ mod tests {
                 data.insert_temp(egui::Id::new("settings-filter"), text.to_string())
             })
         };
-        filter("Normalize");
+        filter("Gapless");
         accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         assert!(
-            shows(&tree, "Keep loud and quiet tracks at a similar level."),
+            shows(&tree, "Play tracks without silence between them."),
             "the description stays as it is"
         );
         let reason = "Not used while Spotify Soloist plays.";
         assert!(!shows(&tree, reason), "the reason waits for a hover");
-        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        let switch = accessible_node(&tree, "Gapless playback", Role::CheckBox);
         let bounds = tree
             .nodes
             .iter()
@@ -6230,7 +6230,23 @@ mod tests {
             &mut app,
             vec![accessible_action(switch, AccessibleAction::Click, None)],
         );
-        assert_eq!(app.settings.normalisation, normalisation, "the value stays");
+        assert_eq!(app.settings.gapless, gapless, "the value stays");
+
+        // Soloist reads its audio quality and loudness from Spotifast.
+        let normalisation = app.settings.normalisation;
+        filter("Normalize");
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(switch, AccessibleAction::Click, None)],
+        );
+        assert_eq!(
+            app.settings.normalisation, !normalisation,
+            "Soloist uses it"
+        );
 
         // A section of librespot's reads the same; hovering it says why.
         filter("Equalizer");
@@ -6258,20 +6274,17 @@ mod tests {
 
         // With librespot playing again, the row is as it always was.
         app.settings.soloist = crate::settings::SoloistUse::Off;
-        filter("Normalize");
+        filter("Gapless");
         accessible_frame(&ctx, &mut app, vec![]);
         let tree = accessible_frame(&ctx, &mut app, vec![]);
-        assert!(shows(
-            &tree,
-            "Keep loud and quiet tracks at a similar level."
-        ));
-        let switch = accessible_node(&tree, "Normalize volume", Role::CheckBox);
+        assert!(shows(&tree, "Play tracks without silence between them."));
+        let switch = accessible_node(&tree, "Gapless playback", Role::CheckBox);
         accessible_frame(
             &ctx,
             &mut app,
             vec![accessible_action(switch, AccessibleAction::Click, None)],
         );
-        assert_eq!(app.settings.normalisation, !normalisation);
+        assert_eq!(app.settings.gapless, !gapless);
         app.backend.shutdown();
     }
 

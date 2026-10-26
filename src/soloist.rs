@@ -65,6 +65,10 @@ pub struct SoloistConfig {
     pub data_dir: PathBuf,
     pub cache_dir: Option<PathBuf>,
     pub cache_mb: Option<u64>,
+    /// Audio quality and Normalize volume, which Soloist reads from its
+    /// prefs files only as it starts: a change starts a new Soloist.
+    pub bitrate_kbps: u16,
+    pub normalisation: bool,
 }
 
 /// The Soloist that outlives librespot's reconnects: Spotify drops that
@@ -687,6 +691,21 @@ impl Soloist {
         // A Soloist a previous run left behind, after a crash or a kill,
         // holds the data directory's lock and its Connect device.
         stop_stale(&config.data_dir).await;
+        let (data_dir, bitrate_kbps, normalisation) = (
+            config.data_dir.clone(),
+            config.bitrate_kbps,
+            config.normalisation,
+        );
+        match tokio::task::spawn_blocking(move || {
+            write_prefs(&data_dir, bitrate_kbps, normalisation)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            // Soloist still plays, with the quality and loudness it had.
+            Ok(Err(error)) => log::warn!("unable to write Soloist's audio settings: {error}"),
+            Err(error) => log::warn!("unable to write Soloist's audio settings: {error}"),
+        }
 
         let mut command = tokio::process::Command::new(&binary);
         command
@@ -1318,6 +1337,77 @@ async fn read_key(path: &Path) -> Result<String> {
     Ok(key)
 }
 
+/// Soloist has no option for its audio quality or loudness normalization:
+/// it reads them as it starts from the desktop client's prefs files in its
+/// data folder, one shared and one per account, which wins key by key.
+const PREF_NORMALIZE: &str = "audio.normalize_v2";
+const PREF_BITRATE: &str = "audio.play_bitrate_enumeration";
+const PREF_BITRATE_NON_METERED: &str = "audio.play_bitrate_non_metered_enumeration";
+/// Without it Soloist derives the non-metered quality from the metered one.
+const PREF_BITRATE_MIGRATED: &str = "audio.play_bitrate_non_metered_migrated";
+
+/// Soloist's quality level for a bitrate: 2 is 96 kbps, 3 is 160 and 4 is
+/// 320. Soloist reads anything outside 1 to 5 as 160, and 5 is lossless,
+/// which Spotifast does not offer.
+fn bitrate_level(kbps: u16) -> u8 {
+    match kbps {
+        96 => 2,
+        160 => 3,
+        _ => 4,
+    }
+}
+
+/// `prefs` with Spotifast's audio settings in place of any it held, and
+/// Soloist's own keys kept.
+fn prefs_with(prefs: &str, bitrate_kbps: u16, normalisation: bool) -> String {
+    let level = bitrate_level(bitrate_kbps);
+    let managed = [
+        (PREF_NORMALIZE, normalisation.to_string()),
+        (PREF_BITRATE, level.to_string()),
+        (PREF_BITRATE_NON_METERED, level.to_string()),
+        (PREF_BITRATE_MIGRATED, "true".to_string()),
+    ];
+    let mut out = String::with_capacity(prefs.len() + 160);
+    for line in prefs.lines() {
+        let key = line.split_once('=').map_or(line, |(key, _)| key);
+        if !line.is_empty() && !managed.iter().any(|(managed, _)| *managed == key) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    for (key, value) in managed {
+        out.push_str(&format!("{key}={value}\n"));
+    }
+    out
+}
+
+/// Blocking: writes the audio settings into every prefs file Soloist
+/// reads. Soloist may drop keys it does not own when it rewrites them, so
+/// this runs before each start.
+fn write_prefs(data_dir: &Path, bitrate_kbps: u16, normalisation: bool) -> std::io::Result<()> {
+    let settings = data_dir.join("settings");
+    let mut files = vec![settings.join("prefs")];
+    match std::fs::read_dir(settings.join("Users")) {
+        Ok(entries) => files.extend(
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| entry.path().join("prefs")),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    for file in files {
+        let prefs = match std::fs::read_to_string(&file) {
+            Ok(prefs) => prefs,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        fastframe_file::write(&file, prefs_with(&prefs, bitrate_kbps, normalisation))?;
+    }
+    Ok(())
+}
+
 fn runtime_files(data_dir: &Path) -> (PathBuf, PathBuf) {
     (data_dir.join("ws.addr"), data_dir.join("ws.port"))
 }
@@ -1939,6 +2029,48 @@ mod tests {
     fn an_api_key_stays_out_of_debug_output() {
         let key = ApiKey("0123456789abcdef".into());
         assert_eq!(format!("{key:?}"), "ApiKey(..)");
+    }
+
+    #[test]
+    fn the_audio_settings_replace_their_own_prefs_and_keep_soloists() {
+        let prefs = "storage.size=1024\naudio.normalize_v2=true\naudio.play_bitrate_enumeration=5\naudio.gapless_migrated_to_ps=true\n";
+        assert_eq!(
+            prefs_with(prefs, 160, false),
+            "storage.size=1024\naudio.gapless_migrated_to_ps=true\n\
+             audio.normalize_v2=false\n\
+             audio.play_bitrate_enumeration=3\n\
+             audio.play_bitrate_non_metered_enumeration=3\n\
+             audio.play_bitrate_non_metered_migrated=true\n"
+        );
+        assert!(prefs_with("", 96, true).contains("audio.play_bitrate_enumeration=2\n"));
+        // Never lossless: anything else is 320 kbps.
+        assert!(prefs_with("", 320, true).contains("audio.play_bitrate_enumeration=4\n"));
+        assert!(prefs_with("", 1411, true).contains("audio.play_bitrate_enumeration=4\n"));
+    }
+
+    #[test]
+    fn the_audio_settings_reach_every_prefs_file() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-soloist-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let user = dir.join("settings/Users/someone-user");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join("prefs"), "audio.normalize_v2=false\nother=1\n").unwrap();
+        write_prefs(&dir, 96, true).unwrap();
+        for file in [dir.join("settings/prefs"), user.join("prefs")] {
+            let prefs = std::fs::read_to_string(&file).unwrap();
+            assert!(prefs.contains("audio.normalize_v2=true\n"), "{prefs}");
+            assert!(
+                prefs.contains("audio.play_bitrate_enumeration=2\n"),
+                "{prefs}"
+            );
+        }
+        assert!(
+            std::fs::read_to_string(user.join("prefs"))
+                .unwrap()
+                .starts_with("other=1\n")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
