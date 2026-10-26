@@ -723,8 +723,9 @@ impl Soloist {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // On Unix it is stopped with a signal it can shut down cleanly
-            // on (`Soloist::shutdown`), and a watchdog stops it if this
-            // process dies first; a kill on drop would cut that short.
+            // on (`Soloist::shutdown`); a kill on drop would cut that short.
+            // One this process leaves behind by dying first is stopped at
+            // the next start (`stop_stale`).
             .kill_on_drop(cfg!(not(unix)));
         // Its output is read from the pipes above, never shown.
         #[cfg(windows)]
@@ -750,10 +751,6 @@ impl Soloist {
         // drops this unsent: nothing is left to wait for.
         let (exited_tx, exited) = watch::channel(false);
         *LAST_STARTED.lock().unwrap_or_else(|p| p.into_inner()) = Some(exited.clone());
-        #[cfg(unix)]
-        if let Some(pid) = pid {
-            watch_parent(pid);
-        }
         let said = Said::new();
         if let Some(out) = child.stdout.take() {
             tokio::spawn(forward_log(out, key.clone(), said.clone()));
@@ -1814,35 +1811,7 @@ fn signal(pid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(pid, signal) == 0 }
 }
 
-/// Stops Soloist if this process ends without doing so itself: crashed,
-/// killed, or quit by a signal that skips shutdown. A shell polls both
-/// processes every two seconds and leaves with Soloist.
-#[cfg(unix)]
-fn watch_parent(soloist: u32) {
-    let parent = std::process::id();
-    let script = format!(
-        "while kill -0 {parent} 2>/dev/null && kill -0 {soloist} 2>/dev/null; do sleep 2; done; \
-         kill -0 {parent} 2>/dev/null || kill -TERM {soloist} 2>/dev/null"
-    );
-    match std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(script)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        // Reaped on a thread of its own, so it leaves no zombie behind.
-        Ok(mut watchdog) => {
-            let _ = std::thread::Builder::new()
-                .name("soloist-watchdog".into())
-                .spawn(move || watchdog.wait());
-        }
-        Err(error) => log::warn!("no watchdog for Soloist: {error}"),
-    }
-}
-
-/// Stops a Soloist still running on `data_dir` from an earlier run,
+/// Stops Soloist if this process ends wia_dir` from an earlier run,
 /// recognised by the pid file Soloist keeps there and its command line,
 /// so an unrelated process that reused the pid is left alone.
 #[cfg(unix)]
