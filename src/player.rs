@@ -1015,9 +1015,7 @@ impl Engine {
                         state.playback = Playback::Loading;
                     }
                 }
-                let runtime =
-                    tokio::runtime::Handle::try_current().context("no runtime to load on")?;
-                runtime.spawn(Arc::clone(soloist).load(self.session.clone(), spec));
+                soloist.start_load(self.session.clone(), spec)?;
             }
             // Carried out over Soloist's API above.
             _ => {}
@@ -1035,6 +1033,18 @@ pub fn soloist_api_command(
 ) -> Option<Result<()>> {
     use serde_json::json;
     let state = soloist.state();
+    if matches!(
+        command,
+        PlayerCommand::Toggle
+            | PlayerCommand::Next
+            | PlayerCommand::Previous
+            | PlayerCommand::Seek(_)
+            | PlayerCommand::Transfer
+    ) {
+        // Where the listener puts playback now outlasts a load's own seek
+        // and pause.
+        soloist.steer();
+    }
     Some(match command {
         PlayerCommand::Toggle => {
             let playing = {
@@ -1068,10 +1078,7 @@ pub fn soloist_api_command(
             soloist.send("set_shuffle", json!({ "enabled": enabled }))
         }
         PlayerCommand::Repeat(mode) => soloist.set_repeat(*mode),
-        PlayerCommand::Transfer => {
-            soloist.claim();
-            soloist.send("activate", json!({}))
-        }
+        PlayerCommand::Transfer => soloist.take_over(),
         PlayerCommand::Load(_) | PlayerCommand::ClearQueue | PlayerCommand::AddToQueue(_) => {
             return None;
         }
@@ -1563,6 +1570,51 @@ mod tests {
     fn a_soloist_play_makes_it_the_active_device_first() {
         assert_eq!(super::soloist_toggle(false), ["activate", "play"]);
         assert_eq!(super::soloist_toggle(true), ["pause"]);
+    }
+
+    /// A load partway into a song keeps seeking there until Soloist lands
+    /// on it, then pauses if it was asked paused. The listener seeking
+    /// meanwhile ends both: their seek is the last word.
+    #[tokio::test(start_paused = true)]
+    async fn the_listeners_seek_ends_a_soloist_loads_own() {
+        use super::{LoadSpec, LocalState, PlayerCommand, SessionConfig, soloist_api_command};
+        use librespot_core::session::Session;
+        use std::time::Duration;
+
+        let (soloist, mut sent) = crate::soloist::Soloist::detached(LocalState::default());
+        let session = Session::new(SessionConfig::default(), None);
+        soloist
+            .start_load(
+                session,
+                LoadSpec {
+                    uris: vec!["spotify:track:a".into()],
+                    position_ms: 60_000,
+                    play: false,
+                    ..LoadSpec::default()
+                },
+            )
+            .unwrap();
+        // Five seconds for Soloist to acknowledge becoming the active
+        // device, then the play and its first seeks.
+        tokio::time::sleep(Duration::from_millis(6_200)).await;
+        soloist_api_command(&soloist, &PlayerCommand::Seek(1_000))
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        let commands: Vec<serde_json::Value> =
+            std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        let theirs = commands
+            .iter()
+            .position(|command| command["position_ms"] == 1_000)
+            .expect("the listener's seek is sent");
+        assert!(
+            commands[..theirs]
+                .iter()
+                .any(|command| command["position_ms"] == 60_000),
+            "the load seeked before the listener did"
+        );
+        assert_eq!(commands.len(), theirs + 1, "nothing after: {commands:?}");
     }
 
     #[test]

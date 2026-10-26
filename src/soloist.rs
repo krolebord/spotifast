@@ -633,6 +633,8 @@ pub struct Soloist {
     /// events may still describe its last song as paused; while this holds
     /// they cannot make this computer the player again.
     elsewhere: Arc<std::sync::atomic::AtomicBool>,
+    /// The listener moved playback here and Soloist has yet to play it.
+    taking_over: Arc<std::sync::atomic::AtomicBool>,
     /// Until when a play asked of this computer outweighs Spotify still
     /// naming another device: its report lags behind the request.
     claimed_until: Mutex<Option<Instant>>,
@@ -645,6 +647,12 @@ pub struct Soloist {
     last_preview: Mutex<Option<Instant>>,
     /// The commands Soloist acknowledges, as it does.
     acks: broadcast::Sender<String>,
+    /// The load under way, stopped by the next: an older one must not
+    /// finish after it and play its song instead.
+    load_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Counts the listener's seeks, skips, plays and pauses. The end of a
+    /// load, its seek and its pause, stops once one comes after it.
+    steered: std::sync::atomic::AtomicU64,
 }
 
 impl Soloist {
@@ -802,6 +810,8 @@ impl Soloist {
         let reader_said = said.clone();
         let elsewhere = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reader_elsewhere = Arc::clone(&elsewhere);
+        let taking_over = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_taking_over = Arc::clone(&taking_over);
         tokio::spawn(async move {
             while let Some(message) = stream.next().await {
                 let text = match message {
@@ -845,7 +855,10 @@ impl Soloist {
                 if event["type"] == "auth_state" && event["logged_in"] == true {
                     reader_said.signed_in();
                 }
-                if apply_event_from(&mut current, &event, now_ms(), &reader_elsewhere) {
+                let mut changed =
+                    apply_event_from(&mut current, &event, now_ms(), &reader_elsewhere);
+                changed |= took_over(&mut current, &reader_taking_over);
+                if changed {
                     let notify = reader_notify
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -890,6 +903,7 @@ impl Soloist {
             pid,
             stopping: std::sync::atomic::AtomicBool::new(false),
             elsewhere,
+            taking_over,
             claimed_until: Mutex::new(None),
             device_id: String::new(),
             stop,
@@ -897,6 +911,8 @@ impl Soloist {
             exited,
             last_preview: Mutex::new(None),
             acks,
+            load_task: Mutex::new(None),
+            steered: std::sync::atomic::AtomicU64::new(0),
         };
         match soloist.sign_in(config, &mut auth, &said).await {
             Ok((device_id, paired)) => {
@@ -1131,6 +1147,7 @@ impl Soloist {
             }
             Some(true) => {
                 self.elsewhere.store(true, Ordering::SeqCst);
+                self.taking_over.store(false, Ordering::SeqCst);
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if deactivate(&mut state) {
                     self.send_state(&state);
@@ -1147,6 +1164,15 @@ impl Soloist {
             Some(Instant::now() + CLAIM);
         self.elsewhere
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The listener moved playback to this computer: Soloist becomes the
+    /// active device, and its first state as the player is told as new.
+    pub fn take_over(&self) -> Result<()> {
+        self.claim();
+        self.taking_over
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.send("activate", json!({}))
     }
 
     /// When the current claim lapses, if it has not yet.
@@ -1230,11 +1256,41 @@ impl Soloist {
         }
     }
 
+    /// Starts `spec` on Soloist in a task of its own, stopping the load
+    /// before it wherever that has got to: its Connect request and the
+    /// librespot retries of it, or its play over Soloist's API.
+    pub fn start_load(self: &Arc<Self>, session: Session, spec: LoadSpec) -> Result<()> {
+        let runtime = tokio::runtime::Handle::try_current().context("no runtime to load on")?;
+        let steered = self.steered.load(std::sync::atomic::Ordering::SeqCst);
+        // Held while the next task starts, so two loads asked at once
+        // cannot both keep running.
+        let mut task = self.load_task.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        let load = runtime.spawn(Arc::clone(self).load(session, spec, steered));
+        *task = Some(load.abort_handle());
+        Ok(())
+    }
+
+    /// The listener seeked, skipped, played or paused: the end of a load
+    /// under way leaves Soloist where they put it.
+    pub fn steer(&self) {
+        self.steered
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the listener has steered since `steered` was read.
+    fn steered_since(&self, steered: u64) -> bool {
+        self.steered.load(std::sync::atomic::Ordering::SeqCst) != steered
+    }
+
     /// Starts `spec` on Soloist. Soloist's own `play` takes one URI and no
     /// starting point, so the load goes over the session's Connect state
     /// service, as Spotify's apps steer any device. If Spotify refuses that,
-    /// Soloist plays the chosen song or context from its start.
-    pub async fn load(self: Arc<Self>, session: Session, spec: LoadSpec) {
+    /// Soloist plays the chosen song or context from its start. `steered`
+    /// is [`Self::steer`]'s count as the load was asked.
+    async fn load(self: Arc<Self>, session: Session, spec: LoadSpec, steered: u64) {
         let body = load_body(&spec);
         let summary = load_summary(&spec);
         let mut result = if self.device_id.is_empty() {
@@ -1288,9 +1344,10 @@ impl Soloist {
             // A context's first song is not known here: any song counts.
             let song = matches!(crate::util::uri_kind(&uri), Some("track" | "episode"))
                 .then_some(uri.as_str());
-            self.seek_until_landed(spec.position_ms, song).await;
+            self.seek_until_landed(spec.position_ms, song, steered)
+                .await;
         }
-        if !spec.play {
+        if !spec.play && !self.steered_since(steered) {
             let _ = self.send("pause", json!({}));
         }
     }
@@ -1320,13 +1377,15 @@ impl Soloist {
 
     /// Seeks to `position_ms` until Soloist reports playing there: it
     /// drops a seek that arrives while the song is still loading. `song`
-    /// is the song the seek is for, when known.
-    async fn seek_until_landed(&self, position_ms: u32, song: Option<&str>) {
+    /// is the song the seek is for, when known. It stops once the listener
+    /// steers since `steered`: their seek or skip is the one that counts.
+    async fn seek_until_landed(&self, position_ms: u32, song: Option<&str>, steered: u64) {
         let started = Instant::now();
         loop {
-            if self
-                .send("seek", json!({ "position_ms": position_ms }))
-                .is_err()
+            if self.steered_since(steered)
+                || self
+                    .send("seek", json!({ "position_ms": position_ms }))
+                    .is_err()
             {
                 return;
             }
@@ -1360,6 +1419,7 @@ impl Soloist {
             pid: None,
             stopping: std::sync::atomic::AtomicBool::new(false),
             elsewhere: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            taking_over: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             claimed_until: Mutex::new(None),
             device_id: String::new(),
             stop: watch::channel(false).0,
@@ -1367,6 +1427,8 @@ impl Soloist {
             exited: watch::channel(false).1,
             last_preview: Mutex::new(None),
             acks: broadcast::channel(16).0,
+            load_task: Mutex::new(None),
+            steered: std::sync::atomic::AtomicU64::new(0),
         };
         (Arc::new(soloist), sent)
     }
@@ -2077,6 +2139,17 @@ fn apply_event_from(
     changed
 }
 
+/// After a transfer here, Soloist's first state as the player counts as a
+/// new song, even the one it showed while another device played it: the
+/// app shows a transfer as landed once the song sequence moves on.
+fn took_over(state: &mut LocalState, taking_over: &std::sync::atomic::AtomicBool) -> bool {
+    if !state.is_active() || !taking_over.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return false;
+    }
+    state.track_sequence = state.track_sequence.wrapping_add(1);
+    true
+}
+
 /// Another device took over: this computer plays nothing now.
 fn deactivate(state: &mut LocalState) -> bool {
     let mut changed = set(&mut state.playback, Playback::Stopped);
@@ -2438,6 +2511,35 @@ mod tests {
         wait_for_last_started().await;
         assert_eq!(started.elapsed(), EXIT_WAIT);
         assert!(LAST_STARTED.lock().unwrap().is_none());
+    }
+
+    /// A song chosen while the last is still loading stops that load: the
+    /// older one cannot finish afterwards and play its song instead.
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_load_stops_the_one_before() {
+        let (soloist, mut sent) = Soloist::detached(LocalState::default());
+        let session = Session::new(librespot_core::config::SessionConfig::default(), None);
+        let song = |uri: &str| LoadSpec {
+            uris: vec![uri.into()],
+            play: true,
+            ..LoadSpec::default()
+        };
+        // With no Connect id, each load plays over the API once Soloist
+        // has had its while to acknowledge becoming the active device.
+        soloist
+            .start_load(session.clone(), song("spotify:track:a"))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        soloist
+            .start_load(session, song("spotify:track:b"))
+            .unwrap();
+        tokio::time::sleep(ACK_TIMEOUT * 2).await;
+
+        let played: Vec<Value> = std::iter::from_fn(|| sent.try_recv().ok())
+            .filter(|command| command["command"] == "play")
+            .map(|command| command["uri"].clone())
+            .collect();
+        assert_eq!(played, [json!("spotify:track:b")]);
     }
 
     /// Soloist may refuse the key and keep running. A later sign-in
@@ -2836,6 +2938,40 @@ mod tests {
         apply_event_from(&mut state, &active, 0, &elsewhere);
         assert!(!elsewhere.load(Ordering::SeqCst));
         assert_eq!(state.playback, Playback::Playing);
+    }
+
+    /// Moving another device's song here keeps the song, so Soloist's
+    /// first state as the player is what tells the app the transfer landed.
+    #[test]
+    fn taking_over_the_song_another_device_played_counts_as_new() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let elsewhere = AtomicBool::new(true);
+        let taking_over = AtomicBool::new(false);
+        let mut state = LocalState::default();
+        let playing = json!({ "type": "playback_changed", "status": "playing" });
+        apply_event_from(&mut state, &track_event(), 0, &elsewhere);
+        apply_event_from(&mut state, &playing, 0, &elsewhere);
+        assert!(!took_over(&mut state, &taking_over));
+        let shown = state.track_sequence;
+
+        // The transfer: claimed, and waiting for Soloist to play.
+        elsewhere.store(false, Ordering::SeqCst);
+        taking_over.store(true, Ordering::SeqCst);
+        let paused_elsewhere = json!({ "type": "device_changed", "is_active": false });
+        apply_event_from(&mut state, &paused_elsewhere, 0, &elsewhere);
+        assert!(!took_over(&mut state, &taking_over));
+        assert_eq!(state.track_sequence, shown);
+
+        let active = json!({ "type": "playback_state", "item": track_event()["item"],
+            "status": "playing", "is_active": true });
+        apply_event_from(&mut state, &active, 0, &elsewhere);
+        assert!(took_over(&mut state, &taking_over));
+        assert_eq!(state.track_sequence, shown + 1);
+
+        // Once only: later events are the same song playing on.
+        apply_event_from(&mut state, &playing, 0, &elsewhere);
+        assert!(!took_over(&mut state, &taking_over));
+        assert_eq!(state.track_sequence, shown + 1);
     }
 
     #[test]
