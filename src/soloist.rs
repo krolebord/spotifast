@@ -188,10 +188,6 @@ const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 /// Beside each build: the `ETag` Spotify's server sent with its archive.
 const ETAG_FILE: &str = "etag";
-/// In the programs folder: touched whenever Spotify's server was asked.
-const CHECKED_FILE: &str = ".checked";
-/// How often Soloist looks for a newer build on its own while in use.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Spotify's archive for this computer, or `None` where it publishes none
 /// (Intel Macs, among others).
@@ -250,11 +246,6 @@ pub struct Downloaded {
 /// `programs`, checks that it runs and has not expired, and removes the
 /// builds it replaces. A failure leaves the installed build as it was.
 pub fn download(client: &reqwest::blocking::Client, programs: &Path) -> Result<Downloaded> {
-    // A check of its own and one the listener asked for share the folder.
-    static DOWNLOADING: Mutex<()> = Mutex::new(());
-    let _one = DOWNLOADING
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let archive = ARCHIVE.context("Spotify publishes no Soloist build for this computer")?;
     std::fs::create_dir_all(programs).context("unable to create Soloist's program folder")?;
     // The installed build and the fingerprint Spotify's server gave it, so
@@ -270,7 +261,6 @@ pub fn download(client: &reqwest::blocking::Client, programs: &Path) -> Result<D
     let result = download_into(client, archive, &staging, programs, known);
     let _ = std::fs::remove_dir_all(&staging);
     let downloaded = result?;
-    let _ = std::fs::write(programs.join(CHECKED_FILE), b"");
     // Older builds; one still running on Windows stays until next time.
     if let Ok(entries) = std::fs::read_dir(programs) {
         for entry in entries.filter_map(Result::ok) {
@@ -345,20 +335,6 @@ fn download_into(
         let _ = std::fs::write(folder.join(ETAG_FILE), etag);
     }
     Ok(downloaded)
-}
-
-/// Whether Soloist should look for a newer build on its own: a downloaded
-/// one is in use and was last checked a day or more ago. Only reads file
-/// metadata.
-pub fn check_due(programs: &Path) -> bool {
-    if ARCHIVE.is_none() || binary_override().is_some() || installed(programs).is_none() {
-        return false;
-    }
-    std::fs::metadata(programs.join(CHECKED_FILE))
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|checked| checked.elapsed().ok())
-        .is_none_or(|since| since >= CHECK_INTERVAL)
 }
 
 /// Unpacks the program from Spotify's archive and installs it under its
@@ -719,8 +695,10 @@ impl Soloist {
         // for this one, may still be shutting down.
         wait_for_last_started().await;
         // A Soloist a previous run left behind, after a crash or a kill,
-        // holds the data directory's lock and its Connect device.
-        stop_stale(&binary, &config.data_dir).await;
+        // holds the data directory's lock and its Connect device. On
+        // Windows its job stops it with this process instead.
+        #[cfg(unix)]
+        stop_stale(&config.data_dir).await;
         let (data_dir, bitrate_kbps, normalisation) = (
             config.data_dir.clone(),
             config.bitrate_kbps,
@@ -1823,103 +1801,41 @@ fn watch_parent(soloist: u32) {
     }
 }
 
-/// Stops a Soloist still running on `data_dir` from an earlier run. On
-/// Unix it is recognised by the pid file Soloist keeps there and its
-/// command line, on Windows by `soloist ctl status`, so an unrelated
-/// process that reused the pid is left alone.
-async fn stop_stale(binary: &Path, data_dir: &Path) {
-    #[cfg(unix)]
-    {
-        let Ok(text) = tokio::fs::read_to_string(data_dir.join("soloist.pid")).await else {
-            return;
-        };
-        let Ok(pid) = text.trim().parse::<u32>() else {
-            return;
-        };
-        if pid == 0 || !signal(pid, 0) {
-            return;
-        }
-        let Ok(output) = tokio::process::Command::new("ps")
-            .args(["-o", "command=", "-p", &pid.to_string()])
-            .output()
-            .await
-        else {
-            return;
-        };
-        let command = String::from_utf8_lossy(&output.stdout);
-        if !command.contains(BINARY) || !command.contains(&*data_dir.to_string_lossy()) {
-            return;
-        }
-        log::warn!("stopping a Soloist left running by an earlier run (pid {pid})");
-        signal(pid, libc::SIGTERM);
-        for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if !signal(pid, 0) {
-                return;
-            }
-        }
-        signal(pid, libc::SIGKILL);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+/// Stops a Soloist still running on `data_dir` from an earlier run,
+/// recognised by the pid file Soloist keeps there and its command line,
+/// so an unrelated process that reused the pid is left alone.
+#[cfg(unix)]
+async fn stop_stale(data_dir: &Path) {
+    let Ok(text) = tokio::fs::read_to_string(data_dir.join("soloist.pid")).await else {
+        return;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return;
+    };
+    if pid == 0 || !signal(pid, 0) {
+        return;
     }
-    #[cfg(windows)]
-    {
-        use std::process::Stdio;
-        let Some(pid) = running_on(binary, data_dir).await else {
-            return;
-        };
-        log::warn!("stopping a Soloist left running by an earlier run (pid {pid})");
-        // Filtered by name too, so a process that reused the pid since is
-        // left alone.
-        let _ = tokio::process::Command::new("taskkill")
-            .arg("/F")
-            .arg("/FI")
-            .arg(format!("PID eq {pid}"))
-            .arg("/FI")
-            .arg(format!("IMAGENAME eq {BINARY}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .await;
-        for _ in 0..30 {
-            if running_on(binary, data_dir).await != Some(pid) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-    #[cfg(unix)]
-    let _ = binary;
-}
-
-/// The pid of the Soloist running on `data_dir`, as `soloist ctl status`
-/// reports it.
-#[cfg(windows)]
-async fn running_on(binary: &Path, data_dir: &Path) -> Option<u32> {
-    use std::process::Stdio;
-    let output = tokio::process::Command::new(binary)
-        .args(["ctl", "status", "-D"])
-        .arg(data_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(Duration::from_secs(3), output)
+    let Ok(output) = tokio::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
         .await
-        .ok()?
-        .ok()?;
-    parse_ctl_status(&String::from_utf8_lossy(&output.stdout))
-}
-
-/// The pid in `soloist ctl status` output, "running (pid 1234)", while
-/// one runs.
-#[cfg(any(windows, test))]
-fn parse_ctl_status(text: &str) -> Option<u32> {
-    let rest = &text[text.find("running (pid ")? + "running (pid ".len()..];
-    rest[..rest.find(')')?].trim().parse().ok()
+    else {
+        return;
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    if !command.contains(BINARY) || !command.contains(&*data_dir.to_string_lossy()) {
+        return;
+    }
+    log::warn!("stopping a Soloist left running by an earlier run (pid {pid})");
+    signal(pid, libc::SIGTERM);
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !signal(pid, 0) {
+            return;
+        }
+    }
+    signal(pid, libc::SIGKILL);
+    tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
 /// A Windows job that stops Soloist once its handle closes: when the
@@ -2581,13 +2497,6 @@ mod tests {
         assert!(state.error.is_some());
     }
 
-    #[test]
-    fn a_leftover_soloist_is_found_by_its_status() {
-        assert_eq!(parse_ctl_status("running (pid 17984)\n"), Some(17984));
-        assert_eq!(parse_ctl_status("not running\n"), None);
-        assert_eq!(parse_ctl_status("running (pid ?)"), None);
-    }
-
     /// The reason is read once both output streams have closed, so a last
     /// line that arrives just after the exit still counts.
     #[tokio::test(start_paused = true)]
@@ -2726,15 +2635,6 @@ mod tests {
             Some((1_792_778_483, dir.join("1792778483").join(BINARY)))
         );
         assert_eq!(installed(&dir.join("missing")), None);
-        if ARCHIVE.is_some() && binary_override().is_none() {
-            assert!(check_due(&dir), "never checked");
-            std::fs::write(dir.join(CHECKED_FILE), b"").unwrap();
-            assert!(!check_due(&dir), "checked a moment ago");
-        }
-        assert!(
-            !check_due(&dir.join("missing")),
-            "nothing downloaded to update"
-        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2828,7 +2728,6 @@ mod tests {
         let program = find_binary_in(&dir).unwrap();
         assert!(program.parent().unwrap().join(ETAG_FILE).is_file());
         assert!(!download(&client, &dir).unwrap().new);
-        assert!(!check_due(&dir), "just checked");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

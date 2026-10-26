@@ -695,10 +695,6 @@ pub struct App {
     pub soloist_downloaded: Option<Result<crate::soloist::Downloaded, String>>,
     /// Soloist was restarted and the engine has not answered yet.
     pub soloist_starting: bool,
-    /// A new build arrived while Soloist played; it takes over on a restart.
-    pub soloist_build_waiting: bool,
-    /// When Soloist last asked the backend whether its daily check is due.
-    soloist_checked: Option<Instant>,
     /// The listener closed the audio-key banner, and no song has played
     /// here since: further refusals only toast.
     audio_key_banner_closed: bool,
@@ -1281,8 +1277,6 @@ impl App {
             soloist_downloading: false,
             soloist_downloaded: None,
             soloist_starting: false,
-            soloist_build_waiting: false,
-            soloist_checked: None,
             audio_key_banner_closed: false,
             shared_rate_limits_seen: 0,
             shared_rate_limited_at: None,
@@ -2499,9 +2493,7 @@ impl App {
             match event {
                 Event::SoloistSignedIn => self.soloist_inspected = false,
                 Event::SoloistInstall(install) => self.soloist_install = Some(install),
-                Event::SoloistDownloaded { asked, result } => {
-                    self.soloist_downloaded(asked, result)
-                }
+                Event::SoloistDownloaded(result) => self.soloist_downloaded(result),
                 Event::PlaylistCoverChecked {
                     id,
                     request,
@@ -12002,7 +11994,6 @@ impl App {
                     std::sync::Arc::clone(&self.winamp.tap),
                     std::sync::Arc::clone(&self.winamp.eq),
                 );
-                self.soloist_build_waiting = false;
                 self.soloist_starting |= self.soloist_restarts();
                 self.backend.send(Command::RestartSoloist(Some(config)));
             }
@@ -12025,9 +12016,6 @@ impl App {
                     std::sync::Arc::clone(&self.winamp.eq),
                 );
                 self.backend.send(Command::RestartEngine(config));
-                if self.settings.soloist == crate::settings::SoloistUse::Off {
-                    self.soloist_build_waiting = false;
-                }
                 self.soloist_starting = self.soloist_restarts();
                 if self.local_ready {
                     self.toast(gettext(self.locale, "Restarting local playback"));
@@ -12512,51 +12500,25 @@ impl App {
         if !self.soloist_downloading {
             self.soloist_downloading = true;
             self.soloist_downloaded = None;
-            self.backend.send(Command::DownloadSoloist { asked: true });
-        }
-    }
-
-    /// While Soloist plays, the backend looks for a newer build once a day;
-    /// it keeps the day across launches, so this only asks it hourly.
-    fn check_soloist(&mut self) {
-        const ASK_EVERY: Duration = Duration::from_secs(60 * 60);
-        if self.settings.soloist == crate::settings::SoloistUse::Always
-            && self
-                .soloist_checked
-                .is_none_or(|checked| checked.elapsed() >= ASK_EVERY)
-        {
-            self.soloist_checked = Some(Instant::now());
-            self.backend.send(Command::DownloadSoloist { asked: false });
+            self.backend.send(Command::DownloadSoloist);
         }
     }
 
     /// A new build plays from Soloist's next start. One that could not
     /// start, missing or expired, or waits to be paired, is started again
-    /// now; one that plays waits for the listener. A check of its own
-    /// speaks only when it brought a new build.
-    fn soloist_downloaded(
+    /// now; one that plays is left playing.
+    pub(crate) fn soloist_downloaded(
         &mut self,
-        asked: bool,
         result: Result<crate::soloist::Downloaded, String>,
     ) {
-        if !asked && !result.as_ref().is_ok_and(|downloaded| downloaded.new) {
-            return;
-        }
-        if asked {
-            self.soloist_downloading = false;
-        }
+        self.soloist_downloading = false;
         self.soloist_inspected = false;
         if result.as_ref().is_ok_and(|downloaded| downloaded.new)
             && self.settings.soloist == crate::settings::SoloistUse::Always
+            && (self.local.error.is_some()
+                || !matches!(self.local_playback, LocalPlayback::Ready { .. }))
         {
-            if self.local.error.is_some()
-                || !matches!(self.local_playback, LocalPlayback::Ready { .. })
-            {
-                // Not playing anything: the new build takes over now.
-                self.actions.push(Action::RestartSoloist);
-            } else {
-                self.soloist_build_waiting = true;
-            }
+            self.actions.push(Action::RestartSoloist);
         }
         self.soloist_downloaded = Some(result);
     }
@@ -12829,7 +12791,6 @@ impl App {
         if self.page() == &Page::Settings || self.audio_key_banner {
             self.inspect_soloist();
         }
-        self.check_soloist();
         // MilkDrop runs in a child process and can outlive the main window.
         // Poll it before applying actions because its keys produce actions.
         #[cfg(feature = "milkdrop")]

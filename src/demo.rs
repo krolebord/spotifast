@@ -6376,22 +6376,11 @@ mod tests {
             "Waiting to be picked: choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi.",
         );
         assert!(!painted_has(&painted, "Pairing"), "told on the switch");
-        assert!(
-            !painted_has(&painted, "Restart Soloist"),
-            "discovery gets its time first"
-        );
-        // Still not picked half a minute on: offer to start it again.
-        ctx.data_mut(|data| data.insert_temp(egui::Id::new("soloist-waiting-since"), -60.0_f64));
-        let painted = soloist_painted(&ctx, &mut app);
-        sidebar_text(&painted, "Restart Soloist");
-        sidebar_text(
-            &painted,
-            "Not showing up on your phone? Check it's on the same Wi-Fi, or restart Soloist.",
-        );
+        // A pick that does not come: Soloist can be started again.
+        sidebar_text(&painted, "Try again");
     }
 
-    /// Pairing has no row: the switch tells it while it is wanted, and a
-    /// search for it finds the switch.
+    /// Pairing has no row: the switch tells it while it is wanted.
     #[test]
     fn soloist_tells_pairing_on_its_switch() {
         let (ctx, mut app) = accessible_app("soloist-paired");
@@ -6408,11 +6397,6 @@ mod tests {
         sidebar_text(&painted, "Remove");
         sidebar_text(&painted, "Check for an update");
         assert!(!painted_has(&painted, "Pairing"));
-        ctx.data_mut(|data| {
-            data.insert_temp(egui::Id::new("settings-filter"), "pair".to_string());
-        });
-        let painted = view_frame(&ctx, &mut app, vec![], crate::ui::settings::show);
-        sidebar_text(&painted, "Use Soloist");
 
         // Signed in to someone else: the switch says what to do.
         app.soloist_install = Some(soloist_install(10, &["someone-else"], true));
@@ -6562,7 +6546,8 @@ mod tests {
         sidebar_text(&painted, "Download");
         sidebar_text(&painted, "Download Soloist first.");
 
-        // A new build while Soloist plays waits for the listener.
+        // A new build leaves a playing Soloist playing, and starts one
+        // that is not playing again at once.
         let me = app.user_id().unwrap_or("someone").to_string();
         let mut install = soloist_install(0, &[&me], true);
         app.soloist_install = Some(install.clone());
@@ -6570,24 +6555,27 @@ mod tests {
         app.local_playback = crate::backend::LocalPlayback::Ready {
             device_id: "soloist".into(),
         };
-        app.soloist_downloading = false;
-        app.soloist_downloaded = Some(Ok(crate::soloist::Downloaded {
-            build: install.build.clone().unwrap(),
-            new: true,
-        }));
-        app.soloist_build_waiting = true;
-        let painted = soloist_painted(&ctx, &mut app);
-        assert!(
-            painted.iter().any(|(text, _)| {
-                text.starts_with("1.3.10.12 · expires ")
-                    && text.ends_with(" · ready after a restart")
-            }),
-            "the new build, and when it takes over"
-        );
-        sidebar_text(&painted, "Restart to use it");
+        let new_build = || {
+            Ok(crate::soloist::Downloaded {
+                build: install.build.clone().unwrap(),
+                new: true,
+            })
+        };
+        app.soloist_downloaded(new_build());
+        assert!(!app.soloist_downloading);
+        let restarts = |app: &App| {
+            app.actions
+                .iter()
+                .any(|action| matches!(action, Action::RestartSoloist))
+        };
+        assert!(!restarts(&app), "playback is not cut short");
+        app.local.error = Some("Spotify Soloist stopped unexpectedly".into());
+        app.soloist_downloaded(new_build());
+        assert!(restarts(&app));
+        app.actions.clear();
+        app.local.error = None;
 
         // A failed check keeps the build's line.
-        app.soloist_build_waiting = false;
         app.soloist_downloaded = Some(Err("unable to download Soloist: timed out".into()));
         let painted = soloist_painted(&ctx, &mut app);
         assert!(

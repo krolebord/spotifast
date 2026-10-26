@@ -706,11 +706,8 @@ pub enum Command {
     /// Find Spotify Soloist and read its build and accounts, off the UI
     /// thread: it runs `soloist --version`.
     InspectSoloist,
-    /// Download Spotify's newest Soloist build from Spotify's servers,
-    /// when the listener `asked`, or on Soloist's own daily check when due.
-    DownloadSoloist {
-        asked: bool,
-    },
+    /// Download Spotify's newest Soloist build from Spotify's servers.
+    DownloadSoloist,
     /// Save the Soloist API key, or remove it with `None`, off the UI
     /// thread, then read Soloist again and restart it if it plays.
     SoloistKey(Option<crate::soloist::ApiKey>),
@@ -988,12 +985,8 @@ pub struct LyricsRequest {
 pub enum Event {
     /// What `Command::InspectSoloist` found.
     SoloistInstall(crate::soloist::Install),
-    /// How `Command::DownloadSoloist` ended; a check that was not due
-    /// sends nothing.
-    SoloistDownloaded {
-        asked: bool,
-        result: Result<crate::soloist::Downloaded, String>,
-    },
+    /// How `Command::DownloadSoloist` ended.
+    SoloistDownloaded(Result<crate::soloist::Downloaded, String>),
     /// Soloist was paired from Spotify's app: its accounts changed.
     SoloistSignedIn,
     /// The folder picked in the local files dialog; `None` when cancelled.
@@ -2237,22 +2230,19 @@ impl Worker {
                         waker.wake();
                     });
                 }
-                Command::DownloadSoloist { asked } => {
+                Command::DownloadSoloist => {
                     let programs = self.dirs.soloist_programs_dir();
                     let proxy = self.engine_config.proxy.clone();
                     let events = self.events.clone();
                     let waker = self.waker.clone();
                     tokio::task::spawn_blocking(move || {
-                        if !asked && !crate::soloist::check_due(&programs) {
-                            return;
-                        }
                         let result = crate::soloist::download_client(&proxy)
                             .and_then(|client| crate::soloist::download(&client, &programs))
                             .map_err(|error| format!("{error:#}"));
                         if let Err(error) = &result {
                             log::warn!("Soloist download failed: {error}");
                         }
-                        let _ = events.send(Event::SoloistDownloaded { asked, result });
+                        let _ = events.send(Event::SoloistDownloaded(result));
                         waker.wake();
                     });
                 }
@@ -3736,10 +3726,6 @@ impl Worker {
         }
     }
 
-    /// Takes the engine down and keeps what its replacement picks up: the
-    /// playback, and the level being heard. A session that drops on its own
-    /// comes back at the level it was heard at, not at the level the app
-    /// launched with.
     /// While the engine reconnects, Soloist plays on and its own API still
     /// answers: what that API can do goes to it now. A load needs Connect,
     /// so the latest one waits for the engine. False when no Soloist runs
@@ -3782,6 +3768,10 @@ impl Worker {
         }
     }
 
+    /// Takes the engine down and keeps what its replacement picks up: the
+    /// playback, and the level being heard. A session that drops on its own
+    /// comes back at the level it was heard at, not at the level the app
+    /// launched with.
     fn take_engine_for_resume(&mut self) {
         self.stop_kept_player();
         self.resume_verify = None;
