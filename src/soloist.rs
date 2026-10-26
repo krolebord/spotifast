@@ -11,7 +11,8 @@
 //!
 //! Soloist is not redistributable: Spotifast never bundles it. When the
 //! user asks, it downloads Spotify's own archive from Spotify's servers into
-//! its data folder, and replaces it the same way when a build nears expiry.
+//! its data folder, and replaces it the same way when they check for an
+//! update.
 //! Its API key is the user's own, read from an owner-only file and handed to
 //! the process at startup; it is never logged.
 
@@ -470,9 +471,6 @@ pub fn inspect(programs: &Path, data_dir: &Path, key_file: &Path) -> Install {
     }
 }
 
-/// Days left before the build expires is "soon" from this many.
-pub const EXPIRY_WARNING_DAYS: i64 = 14;
-
 /// Whom Soloist's stored session belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Paired {
@@ -504,7 +502,6 @@ pub enum Readiness {
     NeedsKey,
     NeedsPairing,
     OtherAccount,
-    ExpiringSoon { days: i64 },
     Ready,
 }
 
@@ -530,25 +527,21 @@ pub fn readiness(facts: &Facts<'_>) -> Readiness {
     if install.binary.is_none() {
         return Readiness::NotFound;
     }
-    let days = install
+    if install
         .build
         .as_ref()
-        .map(|build| days_left(build, facts.now));
-    if days.is_some_and(|days| days < 0) {
+        .is_some_and(|build| days_left(build, facts.now) < 0)
+    {
         return Readiness::Expired;
     }
     if !facts.key_saved {
         return Readiness::NeedsKey;
     }
     match paired(install, facts.account) {
-        Paired::No => return Readiness::NeedsPairing,
-        Paired::OtherAccount => return Readiness::OtherAccount,
-        Paired::ThisAccount if facts.signed_out => return Readiness::NeedsPairing,
-        Paired::ThisAccount => {}
-    }
-    match days {
-        Some(days) if days < EXPIRY_WARNING_DAYS => Readiness::ExpiringSoon { days },
-        _ => Readiness::Ready,
+        Paired::No => Readiness::NeedsPairing,
+        Paired::OtherAccount => Readiness::OtherAccount,
+        Paired::ThisAccount if facts.signed_out => Readiness::NeedsPairing,
+        Paired::ThisAccount => Readiness::Ready,
     }
 }
 
@@ -2336,11 +2329,9 @@ mod tests {
             ..install.clone()
         };
         assert_eq!(readiness(&facts(Some(&missing), now)), Readiness::NotFound);
+        // Days before it expires, it still plays: the date is shown.
         let soon = built.checked_add(day * 80).unwrap();
-        assert_eq!(
-            readiness(&facts(Some(&install), soon)),
-            Readiness::ExpiringSoon { days: 10 }
-        );
+        assert_eq!(readiness(&facts(Some(&install), soon)), Readiness::Ready);
         let late = built.checked_add(day * 91).unwrap();
         assert_eq!(readiness(&facts(Some(&install), late)), Readiness::Expired);
         let mut keyless = facts(Some(&install), now);
