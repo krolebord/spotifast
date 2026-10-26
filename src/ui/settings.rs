@@ -391,10 +391,6 @@ fn soloist_section(
     let locale = app.locale;
     let title = gettext(locale, "Spotify Soloist");
     let install = app.soloist_install.clone();
-    let overridden = install.as_ref().is_some_and(|install| install.overridden);
-    // Spotify publishes a build for this computer, and the one in use is
-    // not set by hand.
-    let downloadable = crate::soloist::ARCHIVE.is_some() && !overridden;
     let downloading = app.soloist_downloading;
     let on = app.settings.soloist == SoloistUse::Always;
     let status = crate::soloist::status(
@@ -423,16 +419,15 @@ fn soloist_section(
             .to_string();
         crate::util::format_date(locale, &day)
     };
-    let unavailable = crate::soloist::ARCHIVE.is_none() && !overridden;
-    // `SPOTIFAST_SOLOIST` names a file that is not there.
-    let override_missing = overridden && found.is_none();
+    // Spotify publishes no build for this computer.
+    let unavailable = crate::soloist::ARCHIVE.is_none();
     let expired = readiness == Readiness::Expired;
     let key_suspect =
         matches!(&status, Status::Failed(error) if crate::soloist::is_key_suspect(error));
 
     // The row that needs the listener next.
     let next = match readiness {
-        _ if override_missing || expired => Some(SoloistStep::Program),
+        _ if expired => Some(SoloistStep::Program),
         Readiness::NotFound | Readiness::ExpiringSoon { .. } => Some(SoloistStep::Program),
         Readiness::NeedsKey => Some(SoloistStep::Key),
         _ if key_suspect => Some(SoloistStep::Key),
@@ -447,9 +442,6 @@ fn soloist_section(
             "Spotify publishes no Soloist build for this computer.",
         )
         .into_owned(),
-        // Translators: {variable} is the name of an environment variable.
-        _ if override_missing => gettext(locale, "{variable} names a missing file.")
-            .replace("{variable}", crate::soloist::BINARY_ENV),
         (_, Readiness::Expired) => gettext(locale, "This build has expired.").into_owned(),
         (_, Readiness::NotFound) => gettext(locale, "Download Soloist first.").into_owned(),
         (_, Readiness::NeedsKey) => gettext(locale, "Add your API key first.").into_owned(),
@@ -514,9 +506,6 @@ fn soloist_section(
     });
     let program_detail = match (&app.soloist_downloaded, &found, build_line) {
         _ if downloading => String::new(),
-        _ if override_missing => std::env::var_os(crate::soloist::BINARY_ENV)
-            .map(|path| std::path::PathBuf::from(path).display().to_string())
-            .unwrap_or_default(),
         // Translators: {build} is the version and expiry line, {error} says why the download failed.
         (Some(Err(error)), _, Some(line)) => gettext(locale, "{build} · download failed: {error}")
             .replace("{build}", &line)
@@ -525,10 +514,6 @@ fn soloist_section(
         (Some(Err(error)), _, None) => {
             gettext(locale, "Download failed: {error}").replace("{error}", error)
         }
-        // Translators: {build} is the version and expiry line, {variable} an environment variable.
-        (_, Some(_), Some(line)) if overridden => gettext(locale, "{build} · from {variable}")
-            .replace("{build}", &line)
-            .replace("{variable}", crate::soloist::BINARY_ENV),
         // Translators: {build} is the version and expiry line before it.
         (Some(Ok(downloaded)), Some(_), Some(line)) if !downloaded.new => {
             gettext(locale, "{build} · up to date").replace("{build}", &line)
@@ -545,7 +530,7 @@ fn soloist_section(
         gettext(locale, "From the Spotify for Developers dashboard.")
     };
     // Not there yet: the row is the download, with nothing to say.
-    let program_title = if found.is_none() && !override_missing {
+    let program_title = if found.is_none() {
         gettext(locale, "Download")
     } else {
         gettext(locale, "Program")
@@ -561,7 +546,7 @@ fn soloist_section(
     *any_visible = true;
     // The download button, primary while Soloist needs it.
     let download = match readiness {
-        _ if !downloadable => None,
+        _ if unavailable => None,
         Readiness::Checking if !downloading => None,
         _ if downloading => Some(gettext(locale, "Downloading…")),
         Readiness::NotFound => Some(gettext(locale, "Download from Spotify")),
@@ -619,7 +604,6 @@ fn soloist_section(
                 }
             }
             if found.is_none()
-                && !override_missing
                 && theme::soft_button(
                     ui,
                     &palette,

@@ -3509,7 +3509,6 @@ mod tests {
 
         app.soloist_install = Some(crate::soloist::Install {
             binary: Some("/opt/soloist/soloist".into()),
-            overridden: false,
             build: Some(crate::soloist::Build {
                 version: "1.3.10.12".into(),
                 built: jiff::Timestamp::now(),
@@ -6294,7 +6293,6 @@ mod tests {
     ) -> crate::soloist::Install {
         crate::soloist::Install {
             binary: Some("/opt/soloist/soloist".into()),
-            overridden: false,
             build: Some(crate::soloist::Build {
                 version: "1.3.10.12".into(),
                 built: jiff::Timestamp::now()
