@@ -493,7 +493,7 @@ pub struct App {
     /// Local play history. See [`crate::history`].
     pub plays: crate::history::History,
     /// Writes settings, session and history off the UI thread.
-    pub(crate) files: fastframe_file::Writer,
+    files: fastframe_file::Writer,
     /// Current track timing used to decide when a play counts.
     listening: Option<Listening>,
     pub recents: crate::model::CursorList<crate::api::models::PlayHistory>,
