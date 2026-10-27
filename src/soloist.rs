@@ -1555,7 +1555,7 @@ const KEY_REJECTED: &str = "Spotify rejected the Soloist API key.";
 const OUTPUT_DRAIN: Duration = Duration::from_secs(1);
 /// How long a stopped Soloist may take to exit: `terminate` waits three
 /// seconds before it kills.
-const EXIT_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(5);
 
 /// A reason Soloist gives on its way out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

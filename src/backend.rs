@@ -715,6 +715,10 @@ pub enum Command {
     /// or key takes over: a plain restart adopts the Soloist that runs.
     /// `None` keeps the engine's configuration.
     RestartSoloist(Option<EngineConfig>),
+    /// Stop Soloist and delete its stored session and device identity, off
+    /// the UI thread, then read Soloist again and restart it if it plays,
+    /// unpaired.
+    UnpairSoloist,
     /// Read or change the login registration, off the UI thread: it reads
     /// and writes a file, the registry or D-Bus, and the Flatpak portal may
     /// ask the person first.
@@ -2272,6 +2276,51 @@ impl Worker {
                         }
                         let install = crate::soloist::inspect(&programs, &data_dir, &key_file);
                         let _ = events.send(Event::SoloistInstall(install));
+                        let _ = commands.send(Command::RestartSoloist(None));
+                        waker.wake();
+                    });
+                }
+                Command::UnpairSoloist => {
+                    let slot = std::sync::Arc::clone(&self.soloist);
+                    let programs = self.dirs.soloist_programs_dir();
+                    let data_dir = self.dirs.soloist_data_dir();
+                    let key_file = self.dirs.soloist_key_file();
+                    let events = self.events.clone();
+                    let commands = self.commands.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        // Soloist holds its session in that folder and may
+                        // write it on its way out: the folder goes once
+                        // Soloist has exited.
+                        let running = slot.lock().await.take();
+                        if let Some(running) = running {
+                            running.soloist.shutdown();
+                            let _ = tokio::time::timeout(
+                                crate::soloist::EXIT_WAIT,
+                                running.soloist.exited(),
+                            )
+                            .await;
+                        }
+                        let read = tokio::task::spawn_blocking(move || {
+                            let removed = match std::fs::remove_dir_all(&data_dir) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    Ok(())
+                                }
+                                result => result,
+                            };
+                            let install = crate::soloist::inspect(&programs, &data_dir, &key_file);
+                            (removed, install)
+                        })
+                        .await;
+                        if let Ok((removed, install)) = read {
+                            if let Err(error) = removed {
+                                log::error!("unable to unpair Soloist: {error}");
+                                let _ = events.send(Event::Error(format!(
+                                    "Couldn't unpair Spotify Soloist: {error}"
+                                )));
+                            }
+                            let _ = events.send(Event::SoloistInstall(install));
+                        }
                         let _ = commands.send(Command::RestartSoloist(None));
                         waker.wake();
                     });
@@ -8528,6 +8577,41 @@ mod authorization_tests {
         runtime.block_on(worker.run(receiver));
         assert!(!next_install(&events).key_saved);
         assert!(!key_file.exists());
+    }
+
+    /// Unpairing deletes Soloist's stored session and device identity and
+    /// reads Soloist again, leaving its key alone.
+    #[test]
+    fn unpairing_forgets_soloists_session_and_keeps_its_key() {
+        let (runtime, mut worker, events) = worker("soloist-unpair");
+        let data_dir = worker.dirs.soloist_data_dir();
+        std::fs::create_dir_all(data_dir.join("settings").join("Users").join("someone-user"))
+            .unwrap();
+        std::fs::write(data_dir.join(".device_id"), "device").unwrap();
+        let key_file = worker.dirs.soloist_key_file();
+        std::fs::write(&key_file, "0123abcd").unwrap();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(Command::UnpairSoloist).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        // The unpairing runs on the runtime, past the worker's shutdown.
+        let install = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match events.try_recv() {
+                        Ok(Event::SoloistInstall(install)) => break install,
+                        Ok(_) => continue,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    }
+                }
+            })
+            .await
+            .expect("a Soloist reading")
+        });
+        assert!(install.accounts.is_empty());
+        assert!(install.key_saved);
+        assert!(!data_dir.exists());
+        assert_eq!(std::fs::read_to_string(&key_file).unwrap(), "0123abcd");
     }
 
     pub(super) fn worker(

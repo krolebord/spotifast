@@ -1392,6 +1392,8 @@ pub enum Action {
     RestartSoloist,
     /// Turn playback through Spotify Soloist on or off, at once.
     SetSoloist(bool),
+    /// Forget the account Soloist is paired with, so it is paired again.
+    UnpairSoloist,
     /// Rebuild the HTTP client with the proxy in settings. Local playback
     /// restarts only when its HTTP proxy changed.
     ApplyProxy,

@@ -6674,6 +6674,60 @@ mod tests {
         assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
     }
 
+    /// Unpair shows once Soloist is signed in to an account and forgets it
+    /// at once; while Soloist plays, the pairing dialog opens for the next.
+    #[test]
+    fn soloist_unpairs_from_its_switch() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+        let (ctx, mut app) = accessible_app("soloist-unpair");
+        app.backend.shutdown();
+        let me = app.user_id().unwrap_or("someone").to_string();
+        app.soloist_install = Some(soloist_install(10, &[&me], true));
+        app.soloist_inspected = true;
+        app.open(crate::model::Page::Settings);
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("settings-filter"), "Soloist".to_string());
+        });
+        let unpaired = |app: &App| {
+            app.soloist_install
+                .as_ref()
+                .is_some_and(|install| install.accounts.is_empty())
+        };
+        let click_unpair = |ctx: &egui::Context, app: &mut App| {
+            accessible_frame(ctx, app, vec![]);
+            let tree = accessible_frame(ctx, app, vec![]);
+            let unpair = accessible_node(&tree, "Unpair", Role::Button);
+            accessible_frame(
+                ctx,
+                app,
+                vec![accessible_action(unpair, AccessibleAction::Click, None)],
+            );
+        };
+
+        // Off: forgotten, with nothing to pair until it is turned on.
+        click_unpair(&ctx, &mut app);
+        assert!(unpaired(&app), "shown unpaired at once");
+        assert!(app.dialog.is_none());
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Unpair")),
+            "nothing left to unpair"
+        );
+
+        // Playing: it starts again unpaired, and the dialog says how.
+        app.soloist_install = Some(soloist_install(10, &[&me], true));
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        app.local_playback = crate::backend::LocalPlayback::Ready {
+            device_id: "soloist".into(),
+        };
+        click_unpair(&ctx, &mut app);
+        assert!(unpaired(&app));
+        assert!(matches!(app.dialog, Some(Dialog::SoloistPairing { .. })));
+    }
+
     /// The pairing dialog only, as the app draws it.
     fn pairing_painted(ctx: &egui::Context, app: &mut App) -> Vec<(String, egui::Rect)> {
         let view: fn(&mut App, &mut egui::Ui) =
