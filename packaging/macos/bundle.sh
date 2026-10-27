@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build Spotifast.app from a GUI binary, on a macOS machine.
+# Build Spotifast Soloist.app from a GUI binary, on a macOS machine.
 #
 #   packaging/macos/bundle.sh <binary> <output.app> <version>
 #
@@ -18,13 +18,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
-executable=Spotifast
-identifier=rocks.spotifast.Spotifast
+name="Spotifast Soloist"
+executable=SpotifastSoloist
+identifier=io.github.krolebord.SpotifastSoloist
 cp "$binary" "$app/Contents/MacOS/$executable"
 chmod 755 "$app/Contents/MacOS/$executable"
 # The build number has to be numbers: a release candidate's -rc1 comes off.
 build="${version%%-*}"
-sed -e "s/__VERSION__/$version/g" -e "s/__BUILD__/$build/g" \
+sed -e "s/__NAME__/$name/g" -e "s/__VERSION__/$version/g" -e "s/__BUILD__/$build/g" \
     -e "s/__EXECUTABLE__/$executable/g" -e "s/__IDENTIFIER__/$identifier/g" "$here/Info.plist" \
     > "$app/Contents/Info.plist"
 # Starting in the tray at login: a login item cannot pass --start-hidden, so

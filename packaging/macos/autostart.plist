@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>rocks.spotifast.Spotifast.autostart</string>
+    <string>io.github.krolebord.SpotifastSoloist.autostart</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/open</string>
         <string>-g</string>
         <string>-b</string>
-        <string>rocks.spotifast.Spotifast</string>
+        <string>io.github.krolebord.SpotifastSoloist</string>
         <string>--args</string>
         <string>--start-hidden</string>
     </array>

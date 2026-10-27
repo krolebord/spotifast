@@ -14,8 +14,8 @@ use fastframe_update::{MacConfig, ReqwestTransport, UpdateConfig};
 
 pub const CONFIG: UpdateConfig = UpdateConfig {
     macos: MacConfig {
-        bundle_ids: &["rocks.spotifast.Spotifast"],
-        executable_names: &["Spotifast"],
+        bundle_ids: &[crate::identity::BUNDLE_ID],
+        executable_names: &["SpotifastSoloist"],
         legacy_bundle_names: &[],
     },
     // Releases publish an Ed25519 signature for checksums.txt. Require it
@@ -26,9 +26,9 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
     // next one.
     appimage: true,
     ..UpdateConfig::new(
-        "crmne/spotifast",
-        "Spotifast",
-        "spotifast",
+        "krolebord/spotifast",
+        crate::identity::NAME,
+        crate::identity::SLUG,
         env!("CARGO_PKG_VERSION"),
     )
 };

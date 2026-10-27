@@ -7591,7 +7591,7 @@ mod tests {
                             "{:?} is cut off at {size:?} in {state:?}",
                             text.galley.job.text
                         );
-                        if text.galley.job.text == "Spotifast" {
+                        if text.galley.job.text == crate::identity::NAME {
                             title = Some(rect);
                         }
                     }
