@@ -1217,7 +1217,7 @@ impl Soloist {
     }
 
     /// Sets the volume, 0..=65535 as librespot counts it. Drags are
-    /// forwarded at most every [`PREVIEW_INTERVAL`].
+    /// forwarded at most every `PREVIEW_INTERVAL`.
     pub fn set_volume(&self, volume: u16, preview: bool) -> Result<()> {
         if preview {
             let mut last = self.last_preview.lock().unwrap_or_else(|p| p.into_inner());
