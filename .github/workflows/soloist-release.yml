@@ -1,0 +1,239 @@
+name: Soloist release
+
+# Spotifast Soloist's release, for the platforms Spotify publishes Soloist
+# for and GitHub has runners for: macOS on Apple silicon, Windows x64, and
+# Linux x86_64 and arm64. Upstream's release.yml stays in the tree for
+# merges but is disabled on this fork (gh workflow disable release.yml): it
+# signs for an updater the fork turns off and publishes to upstream's
+# Homebrew tap and AUR packages.
+#
+# Push a tag matching Cargo.toml's version, with its notes committed in
+# packaging/release-notes/<tag>.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: tag and notes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: The tag is Cargo.toml's version and has notes
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          if [ ! -s "packaging/release-notes/$GITHUB_REF_NAME.md" ]; then
+            echo "::error::packaging/release-notes/$GITHUB_REF_NAME.md is missing"
+            exit 1
+          fi
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Match the native packages' declared glibc 2.39 baseline.
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: x86_64
+          # A native arm64 runner, so the GUI's system libraries need no
+          # cross-compilation sysroot.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # The repository pins its toolchain; add the target to the toolchain
+      # the pin actually resolves to.
+      - run: rustup target add ${{ matrix.target }}
+      - name: GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libpipewire-0.3-dev libxkbcommon-dev \
+            libwayland-dev libgl1-mesa-dev cmake libclang-dev
+      # No compiler cache: published binaries never build from outputs
+      # restored from an Actions cache.
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="spotifast-soloist-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$name"
+          install -m 755 "target/${{ matrix.target }}/release/spotifast" "dist/$name/spotifast-soloist"
+          "dist/$name/spotifast-soloist" --version | grep -Ex 'spotifast [0-9]+\.[0-9]+\.[0-9]+.*'
+          install -m 644 README.md LICENSE packaging/soloist/spotifast-soloist.desktop "dist/$name/"
+          # The desktop entry, the window's app id and the mixer all name
+          # this icon.
+          install -m 644 packaging/icons/spotifast.svg "dist/$name/spotifast-soloist.svg"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows (x64)
+    needs: check
+    runs-on: windows-latest
+    env:
+      CMAKE_GENERATOR: Ninja
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: rustup target add x86_64-pc-windows-msvc
+      # libprojectM reads OpenGL through GLEW on Windows; projectm-sys builds
+      # against vcpkg's static-CRT triplet, matching .cargo/config.toml.
+      - name: GLEW for libprojectM
+        run: vcpkg install glew:x64-windows-static
+      # projectm-sys asks CMake for the Visual Studio generator, which the
+      # runner image no longer satisfies; Ninja inside the MSVC environment
+      # builds the same thing. dumpbin below comes from it too.
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - run: cargo build --locked --release --target x86_64-pc-windows-msvc
+
+      # The zip and installer must run on a clean Windows machine without a
+      # separately installed Visual C++ redistributable.
+      - name: Verify standalone Windows runtime
+        shell: pwsh
+        run: |
+          $binary = "target\$env:TARGET\release\spotifast.exe"
+          $imports = & dumpbin /dependents $binary | Out-String
+          $runtime = $imports | Select-String -Pattern 'MSVCP[0-9_]*\.dll|VCRUNTIME[0-9_]*\.dll'
+          if ($runtime) { throw "Spotifast imports an MSVC runtime:`n$runtime" }
+          $headers = & dumpbin /headers $binary | Out-String
+          if ($headers -notmatch '8664 machine \(x64\)') { throw "$binary is not built for x64:`n$headers" }
+          $version = (& $binary --version | Out-String).Trim()
+          if ($version -notmatch '^spotifast \d+\.\d+\.\d+') { throw "Unexpected --version output: $version" }
+
+      # The portable zip: the marker beside the executable keeps settings in
+      # spotifast-soloist-data next to it.
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          $name = "spotifast-soloist-$env:GITHUB_REF_NAME-windows-x64"
+          New-Item -ItemType Directory -Force "dist\$name" | Out-Null
+          Copy-Item "target\$env:TARGET\release\spotifast.exe" "dist\$name\spotifast-soloist.exe"
+          Copy-Item README.md, LICENSE, packaging\soloist\spotifast-soloist-portable.txt "dist\$name\"
+          Push-Location dist
+          7z a "$name.zip" $name
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      # Inno Setup ships with the runner image. PowerShell, because bash on
+      # Windows rewrites /D... arguments as paths. The installer copies the
+      # binary under its own file name, so it takes the renamed one.
+      - name: Installer
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $name = "spotifast-soloist-$env:GITHUB_REF_NAME-windows-x64"
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DVersion=$version" "/DArch=x86_64" `
+            "/DBinary=$PWD\dist\$name\spotifast-soloist.exe" `
+            "/DOutputDir=$PWD\dist\setup" packaging\windows\spotifast.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Move-Item "dist\setup\*-setup.exe" "dist\$name-setup.exe"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: |
+            dist/*.zip
+            dist/*-setup.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS (Apple silicon)
+    needs: check
+    # An Apple silicon runner: the app is built and started on the
+    # processor it ships for.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - run: rustup target add aarch64-apple-darwin
+      - run: cargo build --locked --release --target aarch64-apple-darwin
+      # No Developer ID: bundle.sh signs ad hoc, which Apple silicon needs
+      # before the app launches at all. The release notes say how to open
+      # an app that is not notarized.
+      - name: App bundle and disk image
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          app="dist/image/Spotifast Soloist.app"
+          mkdir -p dist/image
+          bash packaging/macos/bundle.sh target/aarch64-apple-darwin/release/spotifast "$app" "$version"
+          "$app/Contents/MacOS/SpotifastSoloist" --version | grep -Ex 'spotifast [0-9]+\.[0-9]+\.[0-9]+.*'
+          lipo -archs "$app/Contents/MacOS/SpotifastSoloist" | grep -x arm64
+          cp README.md LICENSE dist/image/
+          ln -s /Applications dist/image/Applications
+          dmg="dist/spotifast-soloist-${GITHUB_REF_NAME}-macos-arm64.dmg"
+          # hdiutil sometimes finds the runner's disk busy; try again.
+          for attempt in 1 2 3; do
+            hdiutil create -volname "Spotifast Soloist" -srcfolder dist/image \
+              -format UDZO "$dmg" && break
+            [ "$attempt" -lt 3 ] || exit 1
+            rm -f "$dmg"
+            sleep 10
+          done
+          hdiutil verify "$dmg"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-arm64
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  publish:
+    name: GitHub release
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > checksums.txt
+          cat checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          name: Spotifast Soloist ${{ github.ref_name }}
+          # Publish the committed notes, not a generated summary.
+          body_path: packaging/release-notes/${{ github.ref_name }}.md
+          generate_release_notes: false
+          # The -soloist suffix marks the fork, not a pre-release.
+          prerelease: false
+          make_latest: true

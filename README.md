@@ -19,6 +19,17 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-1ed760" alt="MIT license"></a>
 </p>
 
+> [!NOTE]
+> **This is Spotifast Soloist**, a fork of
+> [Spotifast](https://github.com/crmne/spotifast) that can also play through
+> [Spotify Soloist](https://developer.spotify.com/documentation/soloist),
+> Spotify's own player. It installs beside Spotifast, with its own settings
+> and sign-in, for macOS on Apple silicon, Windows x64, and Linux x86_64 and
+> arm64, the platforms Spotify publishes Soloist for. It does not update
+> itself: download new versions from
+> [its releases](https://github.com/krolebord/spotifast/releases). Soloist
+> is never bundled; the app downloads it from Spotify.
+
 Spotifast is a Spotify client written in Rust with
 [egui](https://www.egui.rs) and [fastframe](https://fastframe.dev), the
 framework behind a family of native desktop apps. It plays music through
