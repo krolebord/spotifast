@@ -537,7 +537,16 @@ impl Engine {
         let soloist = match &soloist_config {
             None => None,
             Some(soloist_config) => {
-                match Self::adopt_soloist(config, soloist_config, &session, &notify, &slot).await {
+                // A start given up on while Soloist starts (the backend's
+                // connect timeout) drops Spirc's handle with its task running.
+                let given_up = StopSpircOnDrop {
+                    spirc: &spirc,
+                    closing: &closing,
+                };
+                let adopted =
+                    Self::adopt_soloist(config, soloist_config, &session, &notify, &slot).await;
+                std::mem::forget(given_up);
+                match adopted {
                     Ok(soloist) => Some(soloist),
                     Err(error) => {
                         shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -974,6 +983,32 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+/// Spirc's task outlives its handle, and once the handle has gone it spins
+/// on the closed command channel, a core at full use for as long as its
+/// session lasts. An engine let go while Spirc still runs (Soloist ending
+/// hands the backend a live session to reconnect) ends it here, as
+/// `close_session` does, so no `SessionEnded` follows.
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.close_session();
+    }
+}
+
+/// Ends Spirc, as `Engine::close_session` does, for a start dropped before
+/// its engine exists. Forgotten once the start has gone past the wait.
+struct StopSpircOnDrop<'a> {
+    spirc: &'a Spirc,
+    closing: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for StopSpircOnDrop<'_> {
+    fn drop(&mut self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.spirc.shutdown();
     }
 }
 

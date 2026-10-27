@@ -946,19 +946,7 @@ impl Soloist {
                             notify(EngineEvent::State(current.clone()));
                         }
                     }
-                    let commands = soloist.commands.clone();
-                    let mut auth = auth.clone();
-                    tokio::spawn(async move {
-                        while auth.borrow_and_update().is_none_or(|logged_in| !logged_in) {
-                            if commands
-                                .send(json!({ "type": "command", "command": "get_auth_state" }))
-                                .is_err()
-                            {
-                                return;
-                            }
-                            let _ = tokio::time::timeout(PAIRING_POLL, auth.changed()).await;
-                        }
-                    });
+                    tokio::spawn(ask_until_paired(soloist.commands.clone(), auth.clone()));
                 }
                 // Spotify may refuse the key later, which Soloist only
                 // prints: it keeps running and reports nothing else.
@@ -1649,6 +1637,31 @@ fn exit_message(code: Option<i32>, refusal: Option<Refusal>, starting: bool) -> 
 /// waits for it: Soloist locks its data directory, and one started while
 /// the last still holds the lock exits at once.
 static LAST_STARTED: Mutex<Option<watch::Receiver<bool>>> = Mutex::new(None);
+
+/// Asks an unpaired Soloist every `PAIRING_POLL` whether it has signed in,
+/// until it has or it is gone. Each answer is a change to `auth`, signed in
+/// or not, so only a sign-in ends the wait: Soloist answers at once, and
+/// waking on any answer asked it again as fast as it could reply.
+async fn ask_until_paired(
+    commands: mpsc::UnboundedSender<Value>,
+    mut auth: watch::Receiver<Option<bool>>,
+) {
+    while *auth.borrow() != Some(true) {
+        if commands
+            .send(json!({ "type": "command", "command": "get_auth_state" }))
+            .is_err()
+        {
+            return;
+        }
+        // Signed in, or the reader has gone with Soloist.
+        if tokio::time::timeout(PAIRING_POLL, auth.wait_for(|auth| *auth == Some(true)))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
 
 /// Waits, for at most `EXIT_WAIT`, until the Soloist started last exits.
 async fn wait_for_last_started() {
@@ -2564,6 +2577,43 @@ mod tests {
         wait_for_last_started().await;
         assert_eq!(started.elapsed(), EXIT_WAIT);
         assert!(LAST_STARTED.lock().unwrap().is_none());
+    }
+
+    /// An unpaired Soloist is asked whether it has signed in every
+    /// `PAIRING_POLL`. Each "not yet" used to wake the asking at once, and
+    /// both processes spent a core trading the question and its answer.
+    #[tokio::test(start_paused = true)]
+    async fn an_unpaired_soloist_is_asked_once_a_poll() {
+        let (commands, mut asked) = mpsc::unbounded_channel::<Value>();
+        let (auth_tx, auth) = watch::channel(None::<bool>);
+        let auth_tx = Arc::new(auth_tx);
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let answering = Arc::clone(&auth_tx);
+        let counted = Arc::clone(&asks);
+        tokio::spawn(async move {
+            while asked.recv().await.is_some() {
+                // Answered like Soloist, at once, but only so often: asking
+                // on each answer would otherwise never let time pass.
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 10 {
+                    answering.send_replace(Some(false));
+                }
+            }
+        });
+        let asking = tokio::spawn(ask_until_paired(commands, auth));
+        tokio::time::sleep(PAIRING_POLL * 2 + PAIRING_POLL / 2).await;
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        auth_tx.send_replace(Some(true));
+        asking.await.unwrap();
+
+        // A Soloist that stops while unpaired ends the asking with it.
+        let (commands, _asked) = mpsc::unbounded_channel::<Value>();
+        let (auth_tx, auth) = watch::channel(Some(false));
+        let asking = tokio::spawn(ask_until_paired(commands, auth));
+        drop(auth_tx);
+        let started = tokio::time::Instant::now();
+        asking.await.unwrap();
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     /// Quitting from the macOS menu or the Dock exits past the backend's
