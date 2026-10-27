@@ -33,7 +33,7 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
     // next one.
     appimage: true,
     ..UpdateConfig::new(
-        "krolebord/spotifast",
+        "krolebord/spotifast-soloist",
         crate::identity::NAME,
         crate::identity::SLUG,
         env!("CARGO_PKG_VERSION"),

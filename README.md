@@ -27,7 +27,7 @@
 > and sign-in, for macOS on Apple silicon, Windows x64, and Linux x86_64 and
 > arm64, the platforms Spotify publishes Soloist for. It does not update
 > itself: download new versions from
-> [its releases](https://github.com/krolebord/spotifast/releases). Soloist
+> [its releases](https://github.com/krolebord/spotifast-soloist/releases). Soloist
 > is never bundled; the app downloads it from Spotify.
 
 Spotifast is a Spotify client written in Rust with
