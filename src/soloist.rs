@@ -356,7 +356,7 @@ fn install_archive(archive_path: &Path, staging: &Path, programs: &Path) -> Resu
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .context("unable to make Soloist runnable")?;
     }
-    let build = read_build(&binary).context("the downloaded program is not a Soloist build")?;
+    let build = run_version(&binary)?;
     if days_left(&build, jiff::Timestamp::now()) < 0 {
         bail!("Spotify's newest Soloist build has already expired");
     }
@@ -418,14 +418,41 @@ fn no_console(command: &mut std::process::Command) {
 
 /// Blocking: runs `binary --version`.
 pub fn read_build(binary: &Path) -> Option<Build> {
+    run_version(binary).ok()
+}
+
+/// Blocking: runs `binary --version`, and says why when it cannot: on
+/// Linux the build needs a newer C library, or one the system lacks.
+fn run_version(binary: &Path) -> Result<Build> {
     let mut command = std::process::Command::new(binary);
     no_console(&mut command);
     let output = command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .output()
-        .ok()?;
-    parse_version(&String::from_utf8_lossy(&output.stdout))
+        .context("unable to run the downloaded Soloist")?;
+    if let Some(build) = parse_version(&String::from_utf8_lossy(&output.stdout)) {
+        return Ok(build);
+    }
+    match not_running(binary, &String::from_utf8_lossy(&output.stderr)) {
+        Some(reason) => bail!("Soloist does not run on this computer: {reason}"),
+        None => bail!("the downloaded program is not a Soloist build"),
+    }
+}
+
+/// The last line `binary` printed to stderr, without the program's path
+/// the system's loader puts in front of it.
+fn not_running(binary: &Path, stderr: &str) -> Option<String> {
+    let line = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())?;
+    let path = binary.display().to_string();
+    let line = line
+        .strip_prefix(path.as_str())
+        .and_then(|rest| rest.strip_prefix(':'))
+        .map_or(line, str::trim_start);
+    Some(line.chars().take(300).collect())
 }
 
 /// Blocking: the accounts Soloist has signed in to with `data_dir`. It
@@ -2964,6 +2991,40 @@ mod tests {
         let other = dir.join("other");
         std::fs::create_dir_all(other.join("staging")).unwrap();
         assert!(install_archive(&empty, &other.join("staging"), &other).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A build the system cannot load is reported with the loader's words,
+    /// not taken for something that is not Soloist.
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_cannot_load_says_why() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-soloist-loader-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join(BINARY);
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\necho \"$0: error while loading shared libraries: libatomic.so.1: \
+             cannot open shared object file: No such file or directory\" >&2\nexit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            run_version(&binary).unwrap_err().to_string(),
+            "Soloist does not run on this computer: error while loading shared libraries: \
+             libatomic.so.1: cannot open shared object file: No such file or directory"
+        );
+        assert!(read_build(&binary).is_none());
+
+        // Silent and unparsable: not a Soloist build.
+        std::fs::write(&binary, "#!/bin/sh\necho hello\n").unwrap();
+        assert_eq!(
+            run_version(&binary).unwrap_err().to_string(),
+            "the downloaded program is not a Soloist build"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
