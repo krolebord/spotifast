@@ -1063,7 +1063,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         RowText::new(
             update_checks.clone(),
             gettext(locale, "Checks GitHub once a day. No personal data is sent."),
-        ),
+        )
+        .when(crate::updates::ENABLED),
         RowText::new(
             gettext(locale, "Output buffer"),
             gettext(
@@ -1085,7 +1086,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 locale,
                 "Downloads in the background. You choose when to restart.",
             ),
-        ),
+        )
+        .when(crate::updates::ENABLED),
         RowText::new(
             gettext(locale, "MacBook notch widget"),
             gettext(
@@ -2658,8 +2660,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     &check_for_updates
                 };
-                if theme::soft_button(ui, &palette, Some(Icon::Refresh), check_label, false)
-                    .clicked()
+                if crate::updates::ENABLED
+                    && theme::soft_button(ui, &palette, Some(Icon::Refresh), check_label, false)
+                        .clicked()
                     && !app.update_checking
                 {
                     app.actions.push(Action::CheckForUpdates);

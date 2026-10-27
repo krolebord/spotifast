@@ -12538,7 +12538,8 @@ impl App {
     }
 
     fn check_for_updates(&mut self, manual: bool) {
-        if self.update_checking
+        if (!crate::updates::ENABLED && self.update_source.is_github())
+            || self.update_checking
             || (self.offline && self.update_source.is_github())
             || !matches!(
                 self.update_download,
@@ -24045,8 +24046,28 @@ mod tests {
                 app.background_frame(ui.ctx());
             });
             output.textures_delta.clear();
-            assert_eq!(app.last_update_check.is_some(), checked, "{why}");
+            assert_eq!(
+                app.last_update_check.is_some(),
+                checked && crate::updates::ENABLED,
+                "{why}"
+            );
         }
+    }
+
+    /// With updates off, neither the daily check nor Check for Updates asks
+    /// GitHub, whatever an older settings file says.
+    #[test]
+    fn github_is_never_asked_while_updates_are_off() {
+        if crate::updates::ENABLED {
+            return;
+        }
+        let mut app = headless_app();
+        app.settings.check_for_updates = true;
+        app.last_update_check = None;
+        app.check_for_updates(false);
+        app.check_for_updates(true);
+        assert!(!app.update_checking);
+        assert!(app.last_update_check.is_none());
     }
 
     /// An automatic download put off on a metered connection starts once the
