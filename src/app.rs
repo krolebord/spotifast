@@ -12582,7 +12582,7 @@ impl App {
         if !matches!(self.dialog, Some(Dialog::SoloistPairing { .. })) {
             self.toast(gettext(
                 self.locale,
-                "Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.",
+                "Pair Spotify Soloist in Settings to play.",
             ));
         }
     }
@@ -24707,7 +24707,7 @@ mod tests {
         app.handle_local(waiting(&app));
         assert_eq!(
             app.toasts.last().map(|toast| toast.message.as_str()),
-            Some("Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.")
+            Some("Pair Spotify Soloist in Settings to play.")
         );
     }
 
@@ -24728,7 +24728,7 @@ mod tests {
         assert_eq!(app.toasts.len(), toasts + 1);
         assert_eq!(
             app.toasts.last().map(|toast| toast.message.as_str()),
-            Some("Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.")
+            Some("Pair Spotify Soloist in Settings to play.")
         );
         assert!(app.intent_track.is_none(), "no song shown as starting");
         assert!(app.optimistic_playing.is_none());
