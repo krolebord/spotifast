@@ -11999,6 +11999,27 @@ impl App {
                     );
                 });
                 self.open(Page::Settings);
+                // Downloaded and keyed, pairing is all that is left: the
+                // dialog walks through it.
+                if self.soloist_needs_pairing() {
+                    self.dialog = Some(Dialog::SoloistPairing { help: false });
+                }
+            }
+            Action::SetSoloist(on) => {
+                self.settings.soloist = if on {
+                    crate::settings::SoloistUse::Always
+                } else {
+                    crate::settings::SoloistUse::Off
+                };
+                self.settings_dirty = true;
+                if !on && matches!(self.dialog, Some(Dialog::SoloistPairing { .. })) {
+                    self.dialog = None;
+                }
+                // The restart applies any playback setting waiting to be.
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new(crate::ui::settings::PLAYBACK_DIRTY_ID), false);
+                });
+                self.apply(Action::RestartEngine, ctx);
             }
             Action::RestartEngine => {
                 self.save_settings();
@@ -12450,6 +12471,38 @@ impl App {
         }) == crate::soloist::Readiness::Ready
     }
 
+    /// What the Soloist that playback goes through is doing.
+    pub fn soloist_status(&self) -> crate::soloist::Status {
+        crate::soloist::status(
+            self.soloist_plays(),
+            self.soloist_starting,
+            &self.local_playback,
+            self.local.error.as_deref(),
+        )
+    }
+
+    /// What Soloist needs next, given what it is doing.
+    pub fn soloist_readiness(&self, status: &crate::soloist::Status) -> crate::soloist::Readiness {
+        let install = self.soloist_install.as_ref();
+        crate::soloist::readiness(&crate::soloist::Facts {
+            install,
+            key_saved: install.is_some_and(|install| install.key_saved),
+            account: self.user_id(),
+            signed_out: *status == crate::soloist::Status::WaitingForPairing,
+            now: jiff::Timestamp::now(),
+        })
+    }
+
+    /// Whether Soloist is downloaded and keyed but not yet paired with the
+    /// account Spotifast is signed in to.
+    pub fn soloist_needs_pairing(&self) -> bool {
+        use crate::soloist::Readiness;
+        matches!(
+            self.soloist_readiness(&self.soloist_status()),
+            Readiness::NeedsPairing | Readiness::OtherAccount
+        )
+    }
+
     /// Whether Spotify Soloist plays the audio. It plays it itself, so no
     /// sound reaches the visualisers' tap.
     pub fn soloist_plays(&self) -> bool {
@@ -12805,8 +12858,12 @@ impl App {
         self.handle_notch_commands();
         self.tick(ctx);
         self.note_listening();
-        // The audio-key banner offers Soloist once it is ready to play.
-        if self.page() == &Page::Settings || self.audio_key_banner {
+        // The audio-key banner offers Soloist once it is ready to play, and
+        // the pairing dialog sees the pairing land.
+        if self.page() == &Page::Settings
+            || self.audio_key_banner
+            || matches!(self.dialog, Some(Dialog::SoloistPairing { .. }))
+        {
             self.inspect_soloist();
         }
         // MilkDrop runs in a child process and can outlive the main window.

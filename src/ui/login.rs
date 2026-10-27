@@ -392,8 +392,8 @@ fn client_id_field(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// One numbered step of setting up an app.
-fn step(
+/// One numbered step of setting up an app, or of pairing Soloist.
+pub(super) fn step(
     ui: &mut egui::Ui,
     palette: &theme::Palette,
     number: usize,

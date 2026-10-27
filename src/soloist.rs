@@ -1650,7 +1650,7 @@ fn key_rejected() -> String {
     format!("{KEY_REJECTED} Check it in Settings, under Spotify Soloist.")
 }
 
-fn pairing_needed(device_name: &str) -> String {
+pub(crate) fn pairing_needed(device_name: &str) -> String {
     format!(
         "{PAIRING_NEEDED} In the Spotify app on your phone, on the same Wi-Fi, choose \"{device_name}\" once."
     )

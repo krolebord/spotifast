@@ -988,6 +988,50 @@ fn play_here(app: &mut App) {
     app.local.position_ms = now.as_ref().map_or(0, |now| now.position_ms);
 }
 
+/// Settings at the Spotify Soloist section, one step of its setup along:
+/// nothing downloaded, downloaded and keyed but unpaired, on and waiting
+/// for the phone, the pairing dialog (with its tips), and paired.
+#[cfg(feature = "demo")]
+fn demo_soloist(app: &mut App, surface: &str) {
+    let account = app.user_id().unwrap_or("demo").to_string();
+    let found = surface != "soloist-download";
+    let paired = surface == "soloist-paired";
+    app.soloist_inspected = true;
+    app.soloist_install = Some(crate::soloist::Install {
+        binary: found.then(|| "/opt/soloist/soloist".into()),
+        build: found.then(|| crate::soloist::Build {
+            version: "1.3.10.12".into(),
+            built: jiff::Timestamp::now()
+                .checked_sub(jiff::SignedDuration::from_hours(24 * 10))
+                .unwrap(),
+        }),
+        accounts: if paired { vec![account] } else { Vec::new() },
+        key_saved: found,
+    });
+    if matches!(surface, "soloist-download" | "soloist-unpaired") {
+        app.actions.push(Action::SetUpSoloist);
+        // Opening the section leaves the pairing dialog to the switch.
+        app.actions.push(Action::CloseDialog);
+        return;
+    }
+    app.settings.soloist = crate::settings::SoloistUse::Always;
+    app.local_playback = crate::backend::LocalPlayback::Ready {
+        device_id: "soloist".into(),
+    };
+    app.local.error = (!paired).then(|| {
+        crate::soloist::pairing_needed(&crate::player::soloist_device_name(
+            &app.settings.device_name,
+        ))
+    });
+    app.actions.push(Action::SetUpSoloist);
+    app.actions.push(match surface {
+        "soloist-waiting" => Action::CloseDialog,
+        _ => Action::ShowDialog(Dialog::SoloistPairing {
+            help: surface == "soloist-pairing-help",
+        }),
+    });
+}
+
 /// Half a second of stereo sound shaped like a busy mix, the same every
 /// time: a bass line, chords and their overtones at uneven levels up
 /// through the mids and highs, a bright hi-hat hiss and pink noise
@@ -1196,6 +1240,12 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             // Settings for a listener still on the shared grant from before
             // 0.14.2, and for one using their own app.
             "shared-grant" => app.shared_grant = true,
+            "soloist-download"
+            | "soloist-unpaired"
+            | "soloist-waiting"
+            | "soloist-pairing"
+            | "soloist-pairing-help"
+            | "soloist-paired" => demo_soloist(app, surface),
             "own-app" => {
                 app.settings.web_client_id = Some(DEMO_CLIENT_ID.into());
                 app.web_app = Some(DEMO_CLIENT_ID.into());
@@ -6366,7 +6416,7 @@ mod tests {
         app.backend.shutdown();
         app.soloist_install = Some(soloist_install(80, &[], false));
         let painted = soloist_painted(&ctx, &mut app);
-        sidebar_text(&painted, "Add your API key first.");
+        sidebar_text(&painted, "Add your API key to turn this on.");
         assert!(
             painted.iter().any(|(text, _)| {
                 text.starts_with("1.3.10.12 · expires ") && !text.contains(" in ")
@@ -6382,9 +6432,11 @@ mod tests {
 
         app.soloist_install = Some(soloist_install(10, &[], true));
         let painted = soloist_painted(&ctx, &mut app);
+        // Downloaded and keyed: pairing is what is left, and it is told
+        // before Soloist is turned on.
         sidebar_text(
             &painted,
-            "Play through Spotify's own player when Spotify refuses librespot songs.",
+            "Turn this on, then pair it once from the Spotify app on your phone.",
         );
         sidebar_text(&painted, "Saved.");
         sidebar_text(&painted, "Replace");
@@ -6405,13 +6457,11 @@ mod tests {
                 .into(),
         );
         let painted = soloist_painted(&ctx, &mut app);
-        sidebar_text(
-            &painted,
-            "Waiting to be picked: choose Spotifast (soloist) in the Spotify app on your phone, on the same Wi-Fi.",
-        );
+        sidebar_text(&painted, "Waiting to be paired with your Spotify account.");
         assert!(!painted_has(&painted, "Pairing"), "told on the switch");
-        // A pick that does not come: Soloist can be started again.
-        sidebar_text(&painted, "Try again");
+        // The dialog says how, and starts Soloist again when asked.
+        sidebar_text(&painted, "Pair…");
+        assert!(!painted_has(&painted, "Try again"));
     }
 
     /// Pairing has no row: the switch tells it while it is wanted.
@@ -6440,8 +6490,18 @@ mod tests {
             "Paired with another account. Choose Spotifast (soloist) in the Spotify app while signed in to this one.",
         );
         assert!(!painted_has(&painted, "Pairing"));
-        // Off, it is not news.
+        sidebar_text(&painted, "Pair…");
+        // Off, turning it on is the way to pair it with this account.
         app.settings.soloist = crate::settings::SoloistUse::Off;
+        let painted = soloist_painted(&ctx, &mut app);
+        sidebar_text(
+            &painted,
+            "Paired with another account. Turn this on to pair it with this one.",
+        );
+        assert!(!painted_has(&painted, "Pair…"));
+
+        // Paired with this one and off: nothing left to do.
+        app.soloist_install = Some(soloist_install(10, &[&me], true));
         let painted = soloist_painted(&ctx, &mut app);
         sidebar_text(
             &painted,
@@ -6541,6 +6601,7 @@ mod tests {
             vec![accessible_action(switch, AccessibleAction::Click, None)],
         );
         assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
+        assert!(app.dialog.is_none(), "paired already: nothing to pair");
         let tree = accessible_frame(&ctx, &mut app, vec![]);
         assert!(
             !tree
@@ -6549,6 +6610,191 @@ mod tests {
                 .any(|(_, node)| node.label() == Some("Apply and restart playback")),
             "nothing waits to be applied"
         );
+    }
+
+    /// The section reads in the order Soloist is set up: its program, its
+    /// key, then the switch that turns it on.
+    #[test]
+    fn soloist_rows_follow_the_setup_order() {
+        let (ctx, mut app) = accessible_app("soloist-order");
+        app.backend.shutdown();
+        app.soloist_install = Some(soloist_install(10, &[], true));
+        let painted = soloist_painted(&ctx, &mut app);
+        let program = sidebar_text(&painted, "Program");
+        let key = sidebar_text(&painted, "API key");
+        let switch = sidebar_text(&painted, "Use Soloist");
+        assert!(program.top() < key.top(), "the program before its key");
+        assert!(key.top() < switch.top(), "the key before the switch");
+    }
+
+    /// Turning Soloist on before it is paired opens the pairing dialog, and
+    /// Pair opens it again while Soloist waits for the phone.
+    #[test]
+    fn turning_soloist_on_unpaired_opens_the_pairing_dialog() {
+        use egui::accesskit::{Action as AccessibleAction, Role};
+        let (ctx, mut app) = accessible_app("soloist-pair-open");
+        app.backend.shutdown();
+        app.soloist_install = Some(soloist_install(10, &[], true));
+        app.soloist_inspected = true;
+        app.open(crate::model::Page::Settings);
+        ctx.data_mut(|data| {
+            data.insert_temp(egui::Id::new("settings-filter"), "Soloist".to_string());
+        });
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let switch = accessible_node(&tree, "Use Soloist", Role::CheckBox);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(switch, AccessibleAction::Click, None)],
+        );
+        assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::SoloistPairing { help: false })
+        ));
+
+        // Closed, Soloist keeps waiting, and Pair brings the steps back.
+        app.apply(Action::CloseDialog, &ctx);
+        // The restarted engine answers: Soloist runs, waiting for the phone.
+        app.soloist_starting = false;
+        app.local_playback = crate::backend::LocalPlayback::Ready {
+            device_id: "soloist".into(),
+        };
+        app.local.error = Some(crate::soloist::pairing_needed("Spotifast (soloist)"));
+        accessible_frame(&ctx, &mut app, vec![]);
+        let tree = accessible_frame(&ctx, &mut app, vec![]);
+        let pair = accessible_node(&tree, "Pair…", Role::Button);
+        accessible_frame(
+            &ctx,
+            &mut app,
+            vec![accessible_action(pair, AccessibleAction::Click, None)],
+        );
+        assert!(matches!(app.dialog, Some(Dialog::SoloistPairing { .. })));
+        assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
+    }
+
+    /// The pairing dialog only, as the app draws it.
+    fn pairing_painted(ctx: &egui::Context, app: &mut App) -> Vec<(String, egui::Rect)> {
+        let view: fn(&mut App, &mut egui::Ui) =
+            |app, ui| crate::ui::dialogs::show(app, &ui.ctx().clone());
+        for _ in 0..2 {
+            view_frame(ctx, app, vec![], view);
+        }
+        view_frame(ctx, app, vec![], view)
+    }
+
+    /// The pairing dialog gives the steps on the phone and follows Soloist
+    /// live: waiting, signed in to someone else, failed, off, then paired.
+    /// Its tips for a phone that does not list Soloist open on request.
+    #[test]
+    fn soloist_pairing_dialog_follows_the_pairing() {
+        let (ctx, mut app) = accessible_app("soloist-pairing");
+        app.backend.shutdown();
+        let me = app.user_id().unwrap_or("someone").to_string();
+        app.soloist_install = Some(soloist_install(10, &[], true));
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        app.local_playback = crate::backend::LocalPlayback::Ready {
+            device_id: "soloist".into(),
+        };
+        app.local.error = Some(crate::soloist::pairing_needed("Spotifast (soloist)"));
+        app.dialog = Some(Dialog::SoloistPairing { help: false });
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(&painted, "Pair Soloist with Spotify");
+        assert!(
+            painted
+                .iter()
+                .any(|(text, _)| text.starts_with("Open the Spotify app on your phone, signed in")),
+            "whose phone to use"
+        );
+        sidebar_text(
+            &painted,
+            "Connect the phone to the same Wi-Fi as this computer.",
+        );
+        sidebar_text(
+            &painted,
+            "Tap the devices button and choose Spotifast (soloist).",
+        );
+        sidebar_text(&painted, "Waiting for Spotifast (soloist) to be chosen…");
+        sidebar_text(&painted, "Pair later");
+        sidebar_text(&painted, "Restart Soloist");
+        sidebar_text(&painted, "Turn off Soloist");
+        let tips = "Check that the phone and this computer are on the same network. Guest and office Wi-Fi often keep devices from seeing each other.";
+        sidebar_text(&painted, "Don't see Spotifast (soloist)?");
+        assert!(!painted_has(&painted, tips), "tips wait to be asked for");
+
+        app.dialog = Some(Dialog::SoloistPairing { help: true });
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(&painted, tips);
+        sidebar_text(&painted, "Hide tips");
+        #[cfg(target_os = "macos")]
+        sidebar_text(
+            &painted,
+            "Allow Spotifast in System Settings, Privacy & Security, Local Network, then restart Soloist.",
+        );
+
+        // Signed in to someone else and playing for them.
+        app.local.error = None;
+        app.soloist_install = Some(soloist_install(10, &["someone-else"], true));
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(
+            &painted,
+            "Soloist is signed in to another account. Choose Spotifast (soloist) from the app signed in to this one.",
+        );
+
+        // A failed start says why, and Soloist can be started again.
+        app.soloist_install = Some(soloist_install(10, &[], true));
+        let rejected =
+            "Spotify rejected the Soloist API key. Check it in Settings, under Spotify Soloist.";
+        app.local_playback = crate::backend::LocalPlayback::Failed(rejected.into());
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(
+            &painted,
+            "Soloist didn't start. Spotify may have rejected the API key.",
+        );
+        sidebar_text(&painted, "Restart Soloist");
+
+        // Off, it offers to turn Soloist on.
+        app.settings.soloist = crate::settings::SoloistUse::Off;
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(&painted, "Soloist is off. Turn it on to pair it.");
+        sidebar_text(&painted, "Turn on Soloist");
+        assert!(!painted_has(&painted, "Turn off Soloist"));
+
+        // Picked on the phone: it says so, with nothing left but Done.
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        app.local_playback = crate::backend::LocalPlayback::Ready {
+            device_id: "soloist".into(),
+        };
+        app.soloist_install = Some(soloist_install(10, &[&me], true));
+        let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(&painted, "Paired. Soloist plays as Spotifast (soloist).");
+        sidebar_text(&painted, "Done");
+        assert!(!painted_has(&painted, "Don't see Spotifast (soloist)?"));
+        assert!(!painted_has(&painted, "Pair later"));
+    }
+
+    /// Set up Soloist from the audio-key banner lands on the pairing dialog
+    /// once pairing is all that is left, and turning Soloist off from the
+    /// dialog closes it.
+    #[test]
+    fn soloist_pairing_dialog_opens_from_set_up_and_closes_when_off() {
+        let (ctx, mut app) = accessible_app("soloist-pairing-actions");
+        app.backend.shutdown();
+        app.soloist_install = Some(soloist_install(10, &[], false));
+        app.apply(Action::SetUpSoloist, &ctx);
+        assert!(app.dialog.is_none(), "the key comes first, in Settings");
+
+        app.soloist_install = Some(soloist_install(10, &[], true));
+        app.apply(Action::SetUpSoloist, &ctx);
+        assert!(matches!(app.dialog, Some(Dialog::SoloistPairing { .. })));
+
+        app.apply(Action::SetSoloist(true), &ctx);
+        assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Always);
+        assert!(app.dialog.is_some(), "turned on from the dialog, it stays");
+        app.apply(Action::SetSoloist(false), &ctx);
+        assert_eq!(app.settings.soloist, crate::settings::SoloistUse::Off);
+        assert!(app.dialog.is_none());
     }
 
     /// Soloist is downloaded from Spotify when the listener asks, never
@@ -6580,7 +6826,10 @@ mod tests {
         assert!(app.soloist_downloading);
         let painted = soloist_painted(&ctx, &mut app);
         sidebar_text(&painted, "Download");
-        sidebar_text(&painted, "Download Soloist first.");
+        sidebar_text(
+            &painted,
+            "Download Soloist and add your API key to turn this on.",
+        );
 
         // A new build leaves a playing Soloist playing, and starts one
         // that is not playing again at once.
