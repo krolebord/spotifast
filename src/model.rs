@@ -1091,6 +1091,11 @@ pub enum Dialog {
     PremiumNeeded,
     /// Introduce personal Spotify apps to eligible listeners once.
     PersonalAppIntro,
+    /// How to pair Spotify Soloist with the account, and how it is going.
+    /// `help`: the tips for a Soloist the phone does not list are open.
+    SoloistPairing {
+        help: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1385,6 +1390,8 @@ pub enum Action {
     SaveSoloistKey(Option<crate::soloist::ApiKey>),
     /// Start Soloist again, with its newest build and key.
     RestartSoloist,
+    /// Turn playback through Spotify Soloist on or off, at once.
+    SetSoloist(bool),
     /// Rebuild the HTTP client with the proxy in settings. Local playback
     /// restarts only when its HTTP proxy changed.
     ApplyProxy,

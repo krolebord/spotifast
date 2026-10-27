@@ -443,7 +443,9 @@ and `--demo-show` adds surfaces on top of it: a comma separated list of
 `library-grid-wide`, `eq-user-presets`, `start-in-tray`, `rtl`, `player-bar-spectrum`, `player-bar-waveform`,
 `lyrics-fullscreen-view`, `lyrics-fullscreen-instrumental`, `signed-out`, `connecting`,
 `waiting-for-browser`, `sign-in-returning`, `sign-in-malformed`, `sign-in-shared-retired`,
-`sign-in-unknown-client`, `sign-in-not-allowed`, `shared-grant`, and `own-app`. The Library variants show the list or cover grid with
+`sign-in-unknown-client`, `sign-in-not-allowed`, `shared-grant`, `own-app`,
+`soloist-download`, `soloist-unpaired`, `soloist-waiting`, `soloist-pairing`,
+`soloist-pairing-help`, and `soloist-paired`. The Library variants show the list or cover grid with
 a normal, narrow, or wide sidebar and collapsed artwork for matching captures.
 `shuffle-selected` and `shuffle-started` capture the selected-mode and
 playback-started outcomes of a collection Shuffle click. `update` shows a sample
@@ -461,6 +463,10 @@ setting up a Spotify app, before and while the session connects;
 after each way Spotify can turn a sign-in down. `shared-grant` shows
 Settings for a listener still on a shared grant from before 0.14.2, and
 `own-app` for one using their own app.
+The `soloist-` surfaces open Settings at the Spotify Soloist section, one step
+of its setup along: nothing downloaded, downloaded and keyed but not paired,
+on and waiting for the phone, the pairing dialog with and without its tips,
+and the dialog once paired.
 `system-light` and `system-dark` choose Follow system on a desktop that is
 light or dark (on Linux), to show the light and dark mode themes; with an
 explicit `--demo-data` directory, its `config/settings.json` and

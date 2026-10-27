@@ -55,6 +55,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 }
+                Dialog::SoloistPairing { help } => soloist_pairing(app, ui, help),
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {
@@ -230,6 +231,259 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if response.should_close() {
         app.actions.push(Action::CloseDialog);
     }
+}
+
+/// How to pair Spotify Soloist with the account, and how it is going: the
+/// steps in the Spotify app, what Soloist is doing now, what to try when
+/// the app does not list it, and Soloist's own controls. It follows
+/// Soloist live, so it can stay open until the pairing lands.
+fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
+    use crate::soloist::{Readiness, Status};
+    let palette = app.palette;
+    let locale = app.locale;
+    let status = app.soloist_status();
+    let readiness = app.soloist_readiness(&status);
+    let name = crate::player::soloist_device_name(&app.settings.device_name);
+    let account = app.user.as_ref().map(|user| {
+        user.display_name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| user.id.clone())
+    });
+    let paired = status == Status::Playing && readiness != Readiness::OtherAccount;
+    let paragraph = |ui: &mut egui::Ui, text: &str, color| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .font(theme::regular(14.0))
+                    .color(color),
+            )
+            .wrap(),
+        );
+    };
+    // Three buttons side by side need more than the usual width.
+    ui.set_width(460.0);
+    theme::text(
+        ui,
+        gettext(locale, "Pair Soloist with Spotify"),
+        theme::bold(20.0),
+        palette.text,
+    );
+    ui.add_space(8.0);
+    paragraph(
+        ui,
+        &gettext(
+            locale,
+            "Soloist signs in to your account when the Spotify app chooses it, the way it chooses a speaker. You only do this once.",
+        ),
+        palette.secondary,
+    );
+    ui.add_space(14.0);
+    let open_app = match &account {
+        // Translators: {account} is the Spotify account Spotifast is signed in to.
+        Some(account) => gettext(
+            locale,
+            "Open the Spotify app on your phone, signed in as {account}.",
+        )
+        .replace("{account}", account),
+        None => gettext(
+            locale,
+            "Open the Spotify app on your phone, signed in to the same account as Spotifast.",
+        )
+        .into_owned(),
+    };
+    super::login::step(ui, &palette, 1, &open_app, |_| {});
+    super::login::step(
+        ui,
+        &palette,
+        2,
+        &gettext(
+            locale,
+            "Connect the phone to the same Wi-Fi as this computer.",
+        ),
+        |_| {},
+    );
+    super::login::step(
+        ui,
+        &palette,
+        3,
+        // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+        &gettext(locale, "Tap the devices button and choose {name}.").replace("{name}", &name),
+        |_| {},
+    );
+    ui.add_space(10.0);
+
+    // What Soloist is doing now; a spinner while the phone is awaited.
+    let key_suspect =
+        matches!(&status, Status::Failed(error) if crate::soloist::is_key_suspect(error));
+    let (waiting, line, color) = match &status {
+        _ if paired => (
+            false,
+            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+            gettext(locale, "Paired. Soloist plays as {name}.").replace("{name}", &name),
+            palette.accent,
+        ),
+        Status::Off => (
+            false,
+            gettext(locale, "Soloist is off. Turn it on to pair it.").into_owned(),
+            palette.secondary,
+        ),
+        Status::NoPlayback => (
+            false,
+            gettext(locale, "Soloist starts once local playback is set up.").into_owned(),
+            palette.secondary,
+        ),
+        Status::Starting => (
+            true,
+            gettext(locale, "Starting Soloist…").into_owned(),
+            palette.secondary,
+        ),
+        Status::Failed(_) if key_suspect => (
+            false,
+            gettext(
+                locale,
+                "Soloist didn't start. Spotify may have rejected the API key.",
+            )
+            .into_owned(),
+            palette.danger,
+        ),
+        Status::Failed(error) => (false, error.clone(), palette.danger),
+        _ if readiness == Readiness::OtherAccount => (
+            true,
+            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+            gettext(
+                locale,
+                "Soloist is signed in to another account. Choose {name} from the app signed in to this one.",
+            )
+            .replace("{name}", &name),
+            palette.warning,
+        ),
+        _ => (
+            true,
+            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+            gettext(locale, "Waiting for {name} to be chosen…").replace("{name}", &name),
+            palette.text,
+        ),
+    };
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        if waiting {
+            theme::spinner(ui, 18.0, palette.accent);
+        }
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(line)
+                    .font(theme::medium(14.0))
+                    .color(color),
+            )
+            .wrap(),
+        );
+    });
+
+    // What to try when the phone does not list it, on request.
+    if !paired {
+        ui.add_space(10.0);
+        let toggle = if help {
+            gettext(locale, "Hide tips")
+        } else {
+            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
+            gettext(locale, "Don't see {name}?")
+        }
+        .replace("{name}", &name);
+        if theme::link(ui, toggle, theme::medium(13.0), palette.accent).clicked() {
+            app.actions
+                .push(Action::ShowDialog(Dialog::SoloistPairing { help: !help }));
+        }
+        if help {
+            ui.add_space(4.0);
+            let mut tips = vec![gettext(
+                locale,
+                "Check that the phone and this computer are on the same network. Guest and office Wi-Fi often keep devices from seeing each other.",
+            )];
+            #[cfg(target_os = "macos")]
+            tips.push(gettext(
+                locale,
+                "Allow Spotifast in System Settings, Privacy & Security, Local Network, then restart Soloist.",
+            ));
+            #[cfg(windows)]
+            tips.push(gettext(
+                locale,
+                "If Windows Firewall asked about Soloist, allow it on private networks, and make sure this network is set to private.",
+            ));
+            #[cfg(all(unix, not(target_os = "macos")))]
+            tips.push(gettext(
+                locale,
+                "If a firewall runs on this computer, let mDNS (UDP port 5353) and Soloist through it.",
+            ));
+            tips.push(gettext(
+                locale,
+                "Close and reopen the Spotify app, or restart Soloist. Either can take a few seconds to show up.",
+            ));
+            // A short or zoomed-in window scrolls the tips rather than
+            // push the buttons below its edge.
+            let room = ui.ctx().content_rect().height() - ui.min_rect().height() - 170.0;
+            crate::autoscroll::show(
+                ui,
+                egui::ScrollArea::vertical()
+                    .max_height(room.max(60.0))
+                    .auto_shrink([false, true]),
+                egui::Vec2b::new(false, true),
+                |ui| {
+                    for tip in tips {
+                        ui.horizontal_top(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            theme::text(ui, "•", theme::regular(13.0), palette.secondary);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(tip.as_ref())
+                                        .font(theme::regular(13.0))
+                                        .color(palette.secondary),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    }
+                },
+            );
+        }
+    }
+
+    ui.add_space(20.0);
+    // Laid right to left: the first button sits at the edge.
+    buttons(ui, |ui| {
+        if paired {
+            if theme::pill_button(ui, &palette, &gettext(locale, "Done"), true).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+            return;
+        }
+        if status == Status::Off {
+            if theme::pill_button(ui, &palette, &gettext(locale, "Turn on Soloist"), true).clicked()
+            {
+                app.actions.push(Action::SetSoloist(true));
+            }
+            if theme::pill_button(ui, &palette, &gettext(locale, "Not now"), false).clicked() {
+                app.actions.push(Action::CloseDialog);
+            }
+            return;
+        }
+        if theme::pill_button(ui, &palette, &gettext(locale, "Pair later"), false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+        let restartable = !matches!(status, Status::Starting | Status::NoPlayback);
+        if ui
+            .add_enabled_ui(restartable, |ui| {
+                theme::pill_button(ui, &palette, &gettext(locale, "Restart Soloist"), false)
+            })
+            .inner
+            .clicked()
+        {
+            app.actions.push(Action::RestartSoloist);
+        }
+        if theme::pill_button(ui, &palette, &gettext(locale, "Turn off Soloist"), false).clicked() {
+            app.actions.push(Action::SetSoloist(false));
+        }
+    });
 }
 
 // Keep button rows content-sized when the shared modal area last held a taller dialog.
