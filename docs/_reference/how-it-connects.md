@@ -603,7 +603,9 @@ does not save or log the token.
 Playback runs on a separate runtime. Librespot maintains the Spotify Connect
 session, exposes this computer as a device, receives transfers, and reports
 playback state. If the session drops, it reconnects with the stored credential.
-On macOS, while the system reports no route to the internet at all, the
+librespot only marks a dropped session and notices at its next message, so
+Spotifast checks the session every five seconds rather than wait for one,
+which an idle device beside Soloist may not hear for an hour. On macOS, while the system reports no route to the internet at all, the
 reconnection waits for one instead of retrying. Spotifast asks the system
 about the internet as a whole rather than about a Spotify host, so the check
 looks up no name and sends nothing over the network.

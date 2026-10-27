@@ -516,8 +516,9 @@ impl Engine {
         let ended_notify = Arc::clone(&librespot_notify);
         let ended_state = Arc::clone(&librespot_state);
         let ended_interrupted = Arc::clone(&interrupted);
+        let ended_session = session.clone();
         tokio::spawn(async move {
-            spirc_task.await;
+            spirc_until_session_ends(spirc_task, &ended_session).await;
             let shut_down = ended_flag.load(std::sync::atomic::Ordering::SeqCst);
             {
                 let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1154,6 +1155,33 @@ fn resume_from(resume: PlaybackResume, now: Option<&Interrupted>) -> PlaybackRes
 /// The session is gone. librespot's player does not stop with it, so a
 /// song playing or paused stays as it is until the next session takes it
 /// over or the player is stopped (#268); a shutdown asked for stops it.
+/// How often a running session is checked for a dropped connection.
+const SESSION_CHECK: Duration = Duration::from_secs(5);
+
+/// Runs Spirc's task until it ends or `session` loses its connection.
+/// librespot only marks a dropped session invalid and Spirc checks that
+/// at its next message, which may not come for an hour while Soloist
+/// plays and the idle device beside it hears nothing. Dropping the task
+/// ends that Spirc.
+async fn spirc_until_session_ends(
+    spirc_task: impl std::future::Future<Output = ()>,
+    session: &Session,
+) {
+    let dropped = async {
+        let mut check = tokio::time::interval(SESSION_CHECK);
+        loop {
+            check.tick().await;
+            if session.is_invalid() {
+                return;
+            }
+        }
+    };
+    tokio::select! {
+        () = spirc_task => {}
+        () = dropped => log::warn!("Spotify connection dropped; ending the session"),
+    }
+}
+
 fn session_ended(state: &mut LocalState, shut_down: bool) {
     state.connected = false;
     if shut_down || !matches!(state.playback, Playback::Playing | Playback::Paused) {
@@ -1650,6 +1678,38 @@ mod tests {
             "the load seeked before the listener did"
         );
         assert_eq!(commands.len(), theirs + 1, "nothing after: {commands:?}");
+    }
+
+    /// A dropped connection ends Spirc's wait within a check, though no
+    /// message arrives to wake it; a live one leaves Spirc running.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_session_ends_a_spirc_that_hears_nothing() {
+        use super::{SESSION_CHECK, SessionConfig, spirc_until_session_ends};
+        use librespot_core::session::Session;
+        use std::time::Duration;
+
+        let session = Session::new(SessionConfig::default(), None);
+        let live = tokio::time::timeout(
+            Duration::from_secs(600),
+            spirc_until_session_ends(std::future::pending(), &session),
+        )
+        .await;
+        assert!(live.is_err(), "a live session keeps Spirc running");
+
+        let dropping = session.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            dropping.shutdown();
+        });
+        let started = tokio::time::Instant::now();
+        spirc_until_session_ends(std::future::pending(), &session).await;
+        assert!(started.elapsed() <= Duration::from_secs(30) + SESSION_CHECK);
+
+        // Spirc ending on its own ends the wait at once.
+        let session = Session::new(SessionConfig::default(), None);
+        let started = tokio::time::Instant::now();
+        spirc_until_session_ends(std::future::ready(()), &session).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
     }
 
     #[test]
