@@ -3237,13 +3237,7 @@ impl App {
                 // The banner explains it and says what still works.
                 self.audio_key_banner = true;
             } else if crate::soloist::is_pairing_needed(error) {
-                // The pairing dialog says how; elsewhere, where to pair it.
-                if !matches!(self.dialog, Some(Dialog::SoloistPairing { .. })) {
-                    self.toast(gettext(
-                        self.locale,
-                        "Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.",
-                    ));
-                }
+                self.toast_soloist_pairing();
             } else {
                 self.toast_error(engine_error_text(self.locale, error));
             }
@@ -9135,6 +9129,18 @@ impl App {
     }
 
     fn start_play(&mut self, request: PlayRequest, shuffle_first: bool) {
+        // An unpaired Soloist cannot play: say where to pair it rather than
+        // show a play that never starts.
+        if matches!(self.target(), Target::Local)
+            && self
+                .local
+                .error
+                .as_deref()
+                .is_some_and(crate::soloist::is_pairing_needed)
+        {
+            self.toast_soloist_pairing();
+            return;
+        }
         // Shuffle applies across contexts until disabled. A selected row still
         // starts first; otherwise choose a random starting track.
         let mut request = request;
@@ -12568,6 +12574,17 @@ impl App {
             });
         }
         self.apply(Action::RestartEngine, ctx);
+    }
+
+    /// Says Soloist needs pairing. The pairing dialog says how, so this
+    /// says where, and only while that dialog is closed.
+    fn toast_soloist_pairing(&mut self) {
+        if !matches!(self.dialog, Some(Dialog::SoloistPairing { .. })) {
+            self.toast(gettext(
+                self.locale,
+                "Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.",
+            ));
+        }
     }
 
     /// Whether a restart now starts Soloist: it is on, and local playback
@@ -24692,6 +24709,29 @@ mod tests {
             app.toasts.last().map(|toast| toast.message.as_str()),
             Some("Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.")
         );
+    }
+
+    /// A play while Soloist waits to be paired says where to pair it and
+    /// shows nothing as starting: it could never play.
+    #[test]
+    fn a_play_on_an_unpaired_soloist_toasts_instead_of_starting() {
+        let mut app = headless_app();
+        app.local.error = Some(crate::soloist::pairing_needed("Spotifast (soloist)"));
+        let toasts = app.toasts.len();
+        app.play_request(
+            PlayRequest {
+                uris: vec!["spotify:track:a".into()],
+                ..PlayRequest::default()
+            },
+            false,
+        );
+        assert_eq!(app.toasts.len(), toasts + 1);
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.")
+        );
+        assert!(app.intent_track.is_none(), "no song shown as starting");
+        assert!(app.optimistic_playing.is_none());
     }
 
     fn headless_app() -> App {
