@@ -376,9 +376,9 @@ enum SoloistStep {
 /// The Spotify Soloist section, in the order it is set up: its program,
 /// its key, then the switch, whose description says what Soloist is doing
 /// or needs next. Pairing is the switch's to start: turning Soloist on
-/// unpaired opens the pairing dialog, and Pair opens it again while
-/// Soloist waits. The button of the row that needs the listener next is
-/// the primary one.
+/// unpaired opens the pairing dialog, Pair opens it again while Soloist
+/// waits, and Unpair forgets the account to pair it anew. The button of
+/// the row that needs the listener next is the primary one.
 fn soloist_section(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -482,6 +482,11 @@ fn soloist_section(
     // says what to do on the phone.
     let pair = status == Status::WaitingForPairing
         || (status == Status::Playing && readiness == Readiness::OtherAccount);
+    // Signed in to any account: it can be forgotten, to pair Soloist again.
+    let unpair = !unavailable
+        && install
+            .as_ref()
+            .is_some_and(|install| !install.accounts.is_empty());
 
     let build_line = build.as_ref().map(|build| {
         if expired {
@@ -619,6 +624,12 @@ fn soloist_section(
                     .clicked()
             {
                 app.actions.push(Action::RestartSoloist);
+            }
+            if unpair
+                && theme::soft_button(ui, &palette, None, &gettext(locale, "Unpair"), false)
+                    .clicked()
+            {
+                app.actions.push(Action::UnpairSoloist);
             }
         });
     });

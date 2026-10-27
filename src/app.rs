@@ -3236,6 +3236,14 @@ impl App {
             if error == crate::player::AUDIO_KEY_REFUSED && !self.audio_key_banner_closed {
                 // The banner explains it and says what still works.
                 self.audio_key_banner = true;
+            } else if crate::soloist::is_pairing_needed(error) {
+                // The pairing dialog says how; elsewhere, where to pair it.
+                if !matches!(self.dialog, Some(Dialog::SoloistPairing { .. })) {
+                    self.toast(gettext(
+                        self.locale,
+                        "Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.",
+                    ));
+                }
             } else {
                 self.toast_error(engine_error_text(self.locale, error));
             }
@@ -12002,6 +12010,18 @@ impl App {
                 // Downloaded and keyed, pairing is all that is left: the
                 // dialog walks through it.
                 if self.soloist_needs_pairing() {
+                    self.dialog = Some(Dialog::SoloistPairing { help: false });
+                }
+            }
+            Action::UnpairSoloist => {
+                // Shown unpaired at once; the backend's reading confirms it.
+                if let Some(install) = self.soloist_install.as_mut() {
+                    install.accounts.clear();
+                }
+                self.soloist_starting |= self.soloist_restarts();
+                self.backend.send(Command::UnpairSoloist);
+                // It starts again waiting for the phone: the dialog says how.
+                if self.soloist_plays() {
                     self.dialog = Some(Dialog::SoloistPairing { help: false });
                 }
             }
@@ -24645,6 +24665,32 @@ mod tests {
             output.viewport_output[&egui::ViewportId::ROOT]
                 .commands
                 .contains(&egui::ViewportCommand::Fullscreen(false))
+        );
+    }
+
+    /// Soloist waiting to be paired is told by the pairing dialog while it
+    /// is open, and otherwise by a short toast that says where to pair it.
+    #[test]
+    fn soloist_pairing_needed_toasts_only_without_its_dialog() {
+        let mut app = headless_app();
+        let waiting = |app: &App| LocalState {
+            error: Some(crate::soloist::pairing_needed("Spotifast (soloist)")),
+            ..app.local.clone()
+        };
+        let toasts = app.toasts.len();
+        app.dialog = Some(Dialog::SoloistPairing { help: false });
+        app.handle_local(waiting(&app));
+        assert_eq!(app.toasts.len(), toasts, "the dialog already says it");
+
+        app.handle_local(LocalState {
+            error: None,
+            ..app.local.clone()
+        });
+        app.dialog = None;
+        app.handle_local(waiting(&app));
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("Spotify Soloist needs to be paired. Pair it in Settings, under Spotify Soloist.")
         );
     }
 
