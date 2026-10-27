@@ -3980,10 +3980,6 @@ mod tests {
             ("without a cover", "Compact track list"),
             ("Ctrl+0", "Interface zoom"),
             ("Rust", "About"),
-            (
-                "Downloads in the background",
-                "Download updates automatically",
-            ),
         ] {
             let query = if cfg!(target_os = "macos") && query == "Ctrl+0" {
                 "Cmd+0"
@@ -3992,6 +3988,25 @@ mod tests {
             };
             let text = settings_text(&ctx, &mut app, query);
             assert!(text.iter().any(|text| text == row), "{query}: {text:?}");
+        }
+        // With updates off, Settings offers no update controls.
+        if !crate::updates::ENABLED {
+            for (query, row) in [
+                (
+                    "Downloads in the background",
+                    "Download updates automatically",
+                ),
+                ("Checks GitHub", "Automatic update checks"),
+            ] {
+                let text = settings_text(&ctx, &mut app, query);
+                assert!(!text.iter().any(|text| text == row), "{query}: {text:?}");
+            }
+            let text = settings_text(&ctx, &mut app, "Rust");
+            assert!(text.iter().any(|text| text == "Release notes"), "{text:?}");
+            assert!(
+                !text.iter().any(|text| text == "Check for updates"),
+                "{text:?}"
+            );
         }
         // fastframe-audio is the only output: Settings has no backend row.
         for query in ["Rodio", "ALSA", "PulseAudio"] {

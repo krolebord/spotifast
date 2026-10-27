@@ -12,6 +12,13 @@ pub use fastframe_update::{
 };
 use fastframe_update::{MacConfig, ReqwestTransport, UpdateConfig};
 
+/// Whether the app checks GitHub for a newer release. Spotifast Soloist does
+/// not: upstream's releases would replace it with a build without Soloist,
+/// and its own are not signed for the updater. A new version is installed
+/// from the fork's releases page. A local feed (`--demo-update-feed`) still
+/// works, so the update screens stay covered by tests.
+pub const ENABLED: bool = false;
+
 pub const CONFIG: UpdateConfig = UpdateConfig {
     macos: MacConfig {
         bundle_ids: &[crate::identity::BUNDLE_ID],
