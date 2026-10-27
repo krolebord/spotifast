@@ -717,8 +717,9 @@ impl Soloist {
             .stderr(std::process::Stdio::piped())
             // On Unix it is stopped with a signal it can shut down cleanly
             // on (`Soloist::shutdown`); a kill on drop would cut that short.
-            // One this process leaves behind by dying first is stopped at
-            // the next start (`stop_stale`).
+            // One still running as this process exits is signalled then
+            // (`Tracked`); one it leaves behind by dying first is stopped
+            // at the next start (`stop_stale`).
             .kill_on_drop(cfg!(not(unix)));
         // Its output is read from the pipes above, never shown.
         #[cfg(windows)]
@@ -739,6 +740,10 @@ impl Soloist {
         // dies first, which stops Soloist with it.
         #[cfg(windows)]
         let job = job::contain(&child);
+        // Let go of once Soloist has exited, so an exit of this process
+        // that skips the backend's shutdown still stops it.
+        #[cfg(unix)]
+        let tracked = pid.map(Tracked::new);
         // Sent once the process has exited. A start that fails before the
         // supervisor takes the process on kills it and waits for it, then
         // drops this unsent: nothing is left to wait for.
@@ -757,6 +762,10 @@ impl Soloist {
             Ok(port) => port,
             Err(error) => {
                 let _ = child.kill().await;
+                #[cfg(unix)]
+                if let Some(tracked) = tracked {
+                    tracked.exited();
+                }
                 return Err(error);
             }
         };
@@ -765,6 +774,10 @@ impl Soloist {
             Ok(connected) => connected,
             Err(error) => {
                 let _ = child.kill().await;
+                #[cfg(unix)]
+                if let Some(tracked) = tracked {
+                    tracked.exited();
+                }
                 return Err(anyhow!("unable to reach Soloist's local API: {error}"));
             }
         };
@@ -867,6 +880,10 @@ impl Soloist {
             let _job = job;
             tokio::select! {
                 status = child.wait() => {
+                    #[cfg(unix)]
+                    if let Some(tracked) = tracked {
+                        tracked.exited();
+                    }
                     let code = status.ok().and_then(|status| status.code());
                     if let Some(message) = exit_message(code, supervisor_said.refusal().await, false) {
                         log::error!("{message}");
@@ -880,6 +897,10 @@ impl Soloist {
                     let _ = stop_rx.wait_for(|stop| *stop).await;
                 } => {
                     terminate(&mut child).await;
+                    #[cfg(unix)]
+                    if let Some(tracked) = tracked {
+                        tracked.exited();
+                    }
                 }
             }
             let _ = exited_tx.send(true);
@@ -1846,6 +1867,73 @@ async fn stop_stale(data_dir: &Path) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 }
 
+/// The Soloists this process started and has not yet seen exit, by pid.
+#[cfg(unix)]
+static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// Holds a started Soloist's pid in `CHILDREN` until it has exited and
+/// been reaped (`Tracked::exited`). Dropped before then, as a start given
+/// up partway or a supervisor dropped with the runtime is, it stops
+/// Soloist: nothing else would.
+#[cfg(unix)]
+struct Tracked(u32);
+
+#[cfg(unix)]
+impl Tracked {
+    fn new(pid: u32) -> Self {
+        static AT_EXIT: std::sync::Once = std::sync::Once::new();
+        AT_EXIT.call_once(|| {
+            // SAFETY: registers a function that takes nothing and cannot
+            // unwind.
+            if unsafe { libc::atexit(stop_children_at_exit) } != 0 {
+                log::warn!("Soloist may keep running after Spotifast quits");
+            }
+        });
+        CHILDREN.lock().unwrap_or_else(|p| p.into_inner()).push(pid);
+        Self(pid)
+    }
+
+    /// Soloist has exited and been reaped: its pid may now name another
+    /// process, which must not be signalled.
+    fn exited(self) {
+        untrack(self.0);
+        std::mem::forget(self);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        signal(self.0, libc::SIGTERM);
+        untrack(self.0);
+    }
+}
+
+#[cfg(unix)]
+fn untrack(pid: u32) {
+    CHILDREN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|&tracked| tracked != pid);
+}
+
+/// Quitting from the macOS menu, Cmd+Q or the Dock ends the process in
+/// AppKit's `exit()`, which never returns to the shell's shutdown: without
+/// this, Soloist played on with Spotifast gone.
+#[cfg(unix)]
+extern "C" fn stop_children_at_exit() {
+    stop_children();
+}
+
+/// Asks every Soloist still running to shut down cleanly. It does so on
+/// its own; nothing waits for it.
+#[cfg(unix)]
+fn stop_children() {
+    for &pid in CHILDREN.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+        signal(pid, libc::SIGTERM);
+    }
+}
+
 /// A Windows job that stops Soloist once its handle closes: when the
 /// supervisor lets go of it, or Windows does as this process dies.
 #[cfg(windows)]
@@ -2476,6 +2564,80 @@ mod tests {
         wait_for_last_started().await;
         assert_eq!(started.elapsed(), EXIT_WAIT);
         assert!(LAST_STARTED.lock().unwrap().is_none());
+    }
+
+    /// Quitting from the macOS menu or the Dock exits past the backend's
+    /// shutdown, and Soloist used to play on with Spotifast gone.
+    #[cfg(unix)]
+    #[test]
+    fn a_soloist_still_running_is_stopped_as_the_process_exits() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let pid = child.id();
+        let tracked = Tracked::new(pid);
+        stop_children();
+        let status = child.wait().expect("sleep is reaped");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+
+        // One reaped is not signalled again: its pid may be another's.
+        tracked.exited();
+        assert!(!CHILDREN.lock().unwrap().contains(&pid));
+
+        // A start given up partway stops the Soloist it had started.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let pid = child.id();
+        drop(Tracked::new(pid));
+        let status = child.wait().expect("sleep is reaped");
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(!CHILDREN.lock().unwrap().contains(&pid));
+    }
+
+    /// The same through a real `exit()`, which is how AppKit ends the
+    /// process: nothing after it, the backend's shutdown included, runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_soloist_is_stopped_by_an_exit_that_skips_shutdown() {
+        const CHILD: &str = "SPOTIFAST_SOLOIST_EXIT_TEST";
+        const STARTED: &str = "soloist started";
+        if std::env::var_os(CHILD).is_some() {
+            // It holds this process's output open until it ends, which
+            // tells the parent without asking after its pid.
+            let soloist = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep starts");
+            let _tracked = Tracked::new(soloist.id());
+            println!("{STARTED}");
+            std::process::exit(0);
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "soloist::tests::a_soloist_is_stopped_by_an_exit_that_skips_shutdown",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let (read_tx, read) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+            let _ = read_tx.send(text);
+        });
+        let text = read
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Soloist outlived the process that started it");
+        assert!(text.contains(STARTED));
+        assert!(child.wait().unwrap().success());
     }
 
     /// A song chosen while the last is still loading stops that load: the
