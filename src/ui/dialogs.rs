@@ -283,12 +283,12 @@ fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
         // Translators: {account} is the Spotify account Spotifast is signed in to.
         Some(account) => gettext(
             locale,
-            "Open the Spotify app on your phone, signed in as {account}.",
+            "Open the Spotify app on your phone or computer, signed in as {account}.",
         )
         .replace("{account}", account),
         None => gettext(
             locale,
-            "Open the Spotify app on your phone, signed in to the same account as Spotifast.",
+            "Open the Spotify app on your phone or computer, signed in to the same account as Spotifast.",
         )
         .into_owned(),
     };
@@ -393,10 +393,16 @@ fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
         }
         if help {
             ui.add_space(4.0);
-            let mut tips = vec![gettext(
-                locale,
-                "Check that the phone and this computer are on the same network. Guest and office Wi-Fi often keep devices from seeing each other.",
-            )];
+            let mut tips = vec![
+                gettext(
+                    locale,
+                    "Easiest: pair from Spotify's desktop app on this computer.",
+                ),
+                gettext(
+                    locale,
+                    "Check that the phone and this computer are on the same network. Guest and office Wi-Fi often keep devices from seeing each other.",
+                ),
+            ];
             #[cfg(target_os = "macos")]
             tips.push(gettext(
                 locale,

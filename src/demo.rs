@@ -6759,9 +6759,8 @@ mod tests {
         let painted = pairing_painted(&ctx, &mut app);
         sidebar_text(&painted, "Pair Soloist with Spotify");
         assert!(
-            painted
-                .iter()
-                .any(|(text, _)| text.starts_with("Open the Spotify app on your phone, signed in")),
+            painted.iter().any(|(text, _)| text
+                .starts_with("Open the Spotify app on your phone or computer, signed in")),
             "whose phone to use"
         );
         sidebar_text(
@@ -6782,6 +6781,10 @@ mod tests {
 
         app.dialog = Some(Dialog::SoloistPairing { help: true });
         let painted = pairing_painted(&ctx, &mut app);
+        sidebar_text(
+            &painted,
+            "Easiest: pair from Spotify's desktop app on this computer.",
+        );
         sidebar_text(&painted, tips);
         sidebar_text(&painted, "Hide tips");
         #[cfg(target_os = "macos")]
