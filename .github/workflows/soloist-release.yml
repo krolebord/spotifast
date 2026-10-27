@@ -8,7 +8,10 @@ name: Soloist release
 # Homebrew tap and AUR packages.
 #
 # Push a tag matching Cargo.toml's version, with its notes committed in
-# packaging/release-notes/<tag>.md.
+# packaging/release-notes/<tag>.md. Every release's notes carry the
+# installation steps under "## Before you install" (unsigned builds, the
+# Linux desktop entry, updating, no self-update), so a reader never needs
+# an older release's notes.
 
 on:
   push:
@@ -26,15 +29,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: The tag is Cargo.toml's version and has notes
+      - name: The tag is Cargo.toml's version and has notes with install steps
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
-          if [ ! -s "packaging/release-notes/$GITHUB_REF_NAME.md" ]; then
-            echo "::error::packaging/release-notes/$GITHUB_REF_NAME.md is missing"
+          notes="packaging/release-notes/$GITHUB_REF_NAME.md"
+          if [ ! -s "$notes" ]; then
+            echo "::error::$notes is missing"
+            exit 1
+          fi
+          if ! grep -qx '## Before you install' "$notes"; then
+            echo "::error::$notes has no '## Before you install' section"
             exit 1
           fi
 
