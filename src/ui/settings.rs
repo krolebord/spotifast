@@ -760,7 +760,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     ui.data_mut(|data| data.insert_temp(egui::Id::new(SETTINGS_FILTER_ID), filter));
     ui.add_space(4.0);
     // Settings of librespot's player are greyed out while Soloist plays.
-    let soloist_plays = app.settings.soloist == crate::settings::SoloistUse::Always;
+    let soloist_plays = app.soloist_plays();
     let soloist_notice = soloist_plays.then(|| {
         gettext(
             locale,

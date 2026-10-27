@@ -541,7 +541,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     ui,
                     Icon::AudioLines,
                     ICON_BUTTON_ICON,
-                    if app.settings.milkdrop_open {
+                    if app.milkdrop_shown() {
                         palette.accent
                     } else {
                         palette.secondary

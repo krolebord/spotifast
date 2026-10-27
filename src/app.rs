@@ -4008,7 +4008,7 @@ impl App {
     #[cfg(feature = "milkdrop")]
     fn sync_milkdrop(&mut self, ctx: &egui::Context) {
         let presets = self.dirs.milkdrop_dir();
-        let open = self.settings.milkdrop_open;
+        let open = self.milkdrop_shown();
         let size = self.settings.milkdrop_size;
         let pos = self.milkdrop_pos;
         let fullscreen = self.settings.milkdrop_fullscreen;
@@ -4061,7 +4061,7 @@ impl App {
             self.learn_screen_hz(hz);
         }
         // Poll the child while the main window is otherwise idle.
-        if self.settings.milkdrop_open {
+        if self.milkdrop_shown() {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
     }
@@ -12325,6 +12325,14 @@ impl App {
                     self.open_folder(folder);
                 }
             }
+            // Soloist plays the audio itself, so MilkDrop would have nothing
+            // to show: say why instead of opening it.
+            Action::ToggleWinampMilkdrop if self.soloist_plays() => {
+                self.toast(gettext(
+                    self.locale,
+                    "Not used while Spotify Soloist plays.",
+                ));
+            }
             Action::ToggleWinampMilkdrop => {
                 self.settings.milkdrop_open = !self.settings.milkdrop_open;
                 self.settings_dirty = true;
@@ -12442,6 +12450,25 @@ impl App {
         }) == crate::soloist::Readiness::Ready
     }
 
+    /// Whether Spotify Soloist plays the audio. It plays it itself, so no
+    /// sound reaches the visualisers' tap.
+    pub fn soloist_plays(&self) -> bool {
+        self.settings.soloist == crate::settings::SoloistUse::Always
+    }
+
+    /// Whether the playing song feeds the visualisers' tap: it plays here,
+    /// and not through Soloist, whose audio never reaches the tap.
+    pub fn tap_sounding(&self, now: Option<&NowPlaying>) -> bool {
+        !self.soloist_plays() && now.is_some_and(|now| (now.playing || now.loading) && now.local)
+    }
+
+    /// Whether the MilkDrop window is open now: closed while Soloist plays,
+    /// and open again after it if it was open before. The saved choice,
+    /// `settings.milkdrop_open`, is what Settings shows.
+    pub fn milkdrop_shown(&self) -> bool {
+        self.settings.milkdrop_open && !self.soloist_plays()
+    }
+
     /// Turns Soloist on and plays the song Spotify refused librespot through
     /// it, where it is in its context. The request waits for the restarted
     /// engine, as any play does while local playback connects.
@@ -12473,8 +12500,7 @@ impl App {
     /// Whether a restart now starts Soloist: it is on, and local playback
     /// is set up for it to start in.
     fn soloist_restarts(&self) -> bool {
-        self.settings.soloist == crate::settings::SoloistUse::Always
-            && !matches!(self.local_playback, LocalPlayback::Unavailable)
+        self.soloist_plays() && !matches!(self.local_playback, LocalPlayback::Unavailable)
     }
 
     /// Asks the backend about Soloist once, and again after pairing or a
@@ -12505,7 +12531,7 @@ impl App {
         self.soloist_downloading = false;
         self.soloist_inspected = false;
         if result.as_ref().is_ok_and(|downloaded| downloaded.new)
-            && self.settings.soloist == crate::settings::SoloistUse::Always
+            && self.soloist_plays()
             && (self.local.error.is_some()
                 || !matches!(self.local_playback, LocalPlayback::Ready { .. }))
         {
@@ -12953,7 +12979,7 @@ impl App {
     /// media keys and backend events wake the loop at once.
     fn headless_wait(&self) -> fastframe_shell::Headless {
         use fastframe_shell::{HEADLESS_TICK, Headless};
-        if self.settings.milkdrop_open {
+        if self.milkdrop_shown() {
             return Headless::Wait;
         }
         let wait = self
@@ -21829,6 +21855,31 @@ mod tests {
 
         app.settings.milkdrop_open = true;
         assert_eq!(app.headless_wait(), Headless::Wait);
+    }
+
+    /// While Spotify Soloist plays, no sound reaches MilkDrop: its window
+    /// stays closed and opening it says why. The saved choice is untouched
+    /// and opens it again once librespot plays.
+    #[test]
+    fn milkdrop_stays_closed_while_soloist_plays() {
+        use fastframe_shell::Headless;
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        app.settings.milkdrop_open = true;
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        assert!(!app.milkdrop_shown());
+        assert_eq!(app.headless_wait(), Headless::WaitFor(HEADLESS_SLEEP));
+
+        app.apply(Action::ToggleWinampMilkdrop, &ctx);
+        assert!(app.settings.milkdrop_open, "the saved choice stays");
+        assert!(!app.settings_dirty);
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("Not used while Spotify Soloist plays.")
+        );
+
+        app.settings.soloist = crate::settings::SoloistUse::Off;
+        assert!(app.milkdrop_shown());
     }
 
     /// Quit wins over everything, a switch between the main window and the

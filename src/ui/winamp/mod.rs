@@ -737,7 +737,7 @@ fn options_menu(app: &mut App, ui: &mut Ui, unit: f32) {
             app.actions.push(Action::SetWinampTaskbar(visible));
         }
     }
-    let mut milkdrop = app.settings.milkdrop_open;
+    let mut milkdrop = app.milkdrop_shown();
     if ui
         .checkbox(&mut milkdrop, "MilkDrop")
         .on_hover_text(super::keys::MILKDROP_SHORTCUT)
@@ -918,7 +918,7 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
         .lamp_button(
             layout::CLUTTER_V,
             sprites::CLUTTER_V_LIT,
-            app.settings.milkdrop_open,
+            app.milkdrop_shown(),
             "clutter-v",
         )
         .on_hover_text(gettext(app.locale, "Visualisation").as_ref());
@@ -938,7 +938,7 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
             }
         }
         ui.separator();
-        let mut milkdrop = app.settings.milkdrop_open;
+        let mut milkdrop = app.milkdrop_shown();
         if ui
             .checkbox(&mut milkdrop, "MilkDrop")
             .on_hover_text(super::keys::MILKDROP_SHORTCUT)
@@ -952,7 +952,9 @@ fn clutter_bar(app: &mut App, view: &mut View, now: Option<&NowPlaying>) {
 /// The full or rolled-up display: the spectrum analyser, the oscilloscope,
 /// or nothing, in the skin's own colours. A click goes to the next.
 /// Only sound from this computer passes the tap; a device across the room
-/// leaves the bars flat. Returns whether anything is still moving.
+/// leaves the bars flat, as does Soloist, which plays the audio itself.
+/// Unlike the player bar's, it still takes clicks then: each mode looks
+/// different even when flat. Returns whether anything is still moving.
 fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>, area: Area) -> bool {
     if view.interact(area, "visualiser", Sense::click()).clicked() {
         app.actions.push(Action::CycleVisualiser);
@@ -974,7 +976,7 @@ fn visualiser(app: &mut App, view: &mut View, now: Option<&NowPlaying>, area: Ar
         }
     }
     let row_at = |row: u8| u32::from(row) * area.height / u32::from(vis::ROWS);
-    let sounding = now.is_some_and(|now| (now.playing || now.loading) && now.local);
+    let sounding = app.tap_sounding(now);
     match mode {
         VisMode::Bars => {
             let samples = if sounding {

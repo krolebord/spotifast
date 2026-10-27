@@ -5701,8 +5701,22 @@ mod tests {
         assert!(!drawn(&output));
         assert!(!wants_frames(&output), "nothing to animate");
 
-        // #when the song is paused
+        // #when Spotify Soloist plays, no sound reaches the visualizer
         app.settings.player_bar_vis = PlayerBarVis::Waveform;
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        let output = draw(&mut app);
+        assert!(!drawn(&output), "off while Soloist plays");
+        assert!(!wants_frames(&output), "nothing to animate");
+        assert_eq!(
+            app.settings.player_bar_vis,
+            PlayerBarVis::Waveform,
+            "the saved choice stays for librespot"
+        );
+        app.settings.soloist = crate::settings::SoloistUse::Off;
+        let output = draw(&mut app);
+        assert!(waveform(&output), "back once librespot plays again");
+
+        // #when the song is paused
         app.local.playback = crate::player::Playback::Paused;
         let output = draw(&mut app);
         assert!(!waveform(&output), "a paused song is still");
@@ -5748,6 +5762,16 @@ mod tests {
                 .any(|action| matches!(action, Action::CyclePlayerBarVis))
         );
         app.settings.player_bar_vis_click = true;
+
+        // Nor while Spotify Soloist plays and the bar shows no visualizer.
+        app.settings.soloist = crate::settings::SoloistUse::Always;
+        draw(&mut app, pointer_click(empty, egui::PointerButton::Primary));
+        assert!(
+            !app.actions
+                .iter()
+                .any(|action| matches!(action, Action::CyclePlayerBarVis))
+        );
+        app.settings.soloist = crate::settings::SoloistUse::Off;
 
         // The play button, in the middle of the bar, is still the play button.
         app.actions.clear();

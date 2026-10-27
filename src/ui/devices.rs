@@ -259,7 +259,7 @@ fn output_picker(app: &mut App, ui: &mut egui::Ui) {
     let listed = app.output_devices.get().map_or(&[][..], Vec::as_slice);
     // Soloist plays to the system's output itself; the choice waits for
     // librespot, greyed out with the reason on hover.
-    let soloist_plays = app.settings.soloist == crate::settings::SoloistUse::Always;
+    let soloist_plays = app.soloist_plays();
     let current_name = current
         .as_deref()
         .map(|saved| saved_output_name(saved, listed).to_string());
