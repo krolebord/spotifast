@@ -6769,12 +6769,12 @@ mod tests {
             &painted,
             "Tap the devices button and choose Spotifast (soloist).",
         );
-        sidebar_text(&painted, "Waiting for Spotifast (soloist) to be chosen…");
+        sidebar_text(&painted, "Waiting for your phone…");
         sidebar_text(&painted, "Pair later");
         sidebar_text(&painted, "Restart Soloist");
         sidebar_text(&painted, "Turn off Soloist");
         let tips = "Check that the phone and this computer are on the same network. Guest and office Wi-Fi often keep devices from seeing each other.";
-        sidebar_text(&painted, "Don't see Spotifast (soloist)?");
+        sidebar_text(&painted, "Don't see it?");
         assert!(!painted_has(&painted, tips), "tips wait to be asked for");
 
         app.dialog = Some(Dialog::SoloistPairing { help: true });
@@ -6824,7 +6824,7 @@ mod tests {
         let painted = pairing_painted(&ctx, &mut app);
         sidebar_text(&painted, "Paired. Soloist plays as Spotifast (soloist).");
         sidebar_text(&painted, "Done");
-        assert!(!painted_has(&painted, "Don't see Spotifast (soloist)?"));
+        assert!(!painted_has(&painted, "Don't see it?"));
         assert!(!painted_has(&painted, "Pair later"));
     }
 

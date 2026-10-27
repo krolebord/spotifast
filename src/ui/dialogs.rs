@@ -274,7 +274,7 @@ fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
         ui,
         &gettext(
             locale,
-            "Soloist signs in to your account when the Spotify app chooses it, the way it chooses a speaker. You only do this once.",
+            "Pick Soloist as a speaker in the Spotify app and it signs in to your account. You only need to do this once.",
         ),
         palette.secondary,
     );
@@ -360,8 +360,7 @@ fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
         ),
         _ => (
             true,
-            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-            gettext(locale, "Waiting for {name} to be chosen…").replace("{name}", &name),
+            gettext(locale, "Waiting for your phone…").into_owned(),
             palette.text,
         ),
     };
@@ -386,10 +385,8 @@ fn soloist_pairing(app: &mut App, ui: &mut egui::Ui, help: bool) {
         let toggle = if help {
             gettext(locale, "Hide tips")
         } else {
-            // Translators: {name} is how Spotify Soloist appears in Spotify Connect.
-            gettext(locale, "Don't see {name}?")
-        }
-        .replace("{name}", &name);
+            gettext(locale, "Don't see it?")
+        };
         if theme::link(ui, toggle, theme::medium(13.0), palette.accent).clicked() {
             app.actions
                 .push(Action::ShowDialog(Dialog::SoloistPairing { help: !help }));
