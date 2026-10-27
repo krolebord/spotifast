@@ -19,6 +19,7 @@ pub mod eq;
 pub mod history;
 pub mod http;
 pub mod i18n;
+pub mod identity;
 pub mod images;
 pub mod liked;
 pub mod limiter;

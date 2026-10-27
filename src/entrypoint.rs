@@ -297,7 +297,7 @@ fn write_reply(out: &mut impl std::io::Write, text: &str) -> i32 {
 /// sandbox's app id, which Flatpak always sets in `FLATPAK_ID`.
 #[cfg(target_os = "linux")]
 fn desktop_entry() -> String {
-    fastframe_now_playing::desktop_entry("spotifast")
+    fastframe_now_playing::desktop_entry(spotifast::identity::SLUG)
 }
 
 /// The `nowplaying` snapshot as one human-readable line.
@@ -731,7 +731,7 @@ pub(crate) fn run() -> eframe::Result<()> {
                 screen_asked: None,
             }))
         }));
-        fastframe_graphics::Graphics::new("Spotifast")
+        fastframe_graphics::Graphics::new(spotifast::identity::NAME)
             .help(spotifast::window::DOWNLOAD_PAGE)
             .dialog(move |trouble| spotifast::window::no_window_dialog(locale, trouble))
             .run_native(
@@ -851,12 +851,12 @@ fn native_options(
     #[cfg(target_os = "linux")]
     let persistence_path = persistence_path.or_else(|| {
         // Keep the native profile path even when Flatpak supplies its app ID.
-        eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
+        eframe::storage_dir(spotifast::identity::SLUG).map(|dir| dir.join("app.ron"))
     });
     #[cfg(target_os = "linux")]
     let app_id = desktop_entry();
     #[cfg(not(target_os = "linux"))]
-    let app_id = "spotifast";
+    let app_id = spotifast::identity::SLUG;
     let icon = if cfg!(target_os = "macos") {
         // macOS takes the dock icon from the bundle's .icns, which is the
         // 1024px drawing with the platform's rounding. Setting a window
@@ -866,7 +866,7 @@ fn native_options(
         app_icon()
     };
     let viewport = egui::ViewportBuilder::default()
-        .with_title("Spotifast")
+        .with_title(spotifast::identity::NAME)
         .with_app_id(app_id)
         .with_taskbar(true)
         .with_icon(icon);
@@ -933,7 +933,8 @@ fn native_options(
 
 fn profile_options(mut options: eframe::NativeOptions) -> eframe::NativeOptions {
     if options.persist_window {
-        options.persistence_path = eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"));
+        options.persistence_path =
+            eframe::storage_dir(spotifast::identity::SLUG).map(|dir| dir.join("app.ron"));
     }
     options
 }
@@ -977,7 +978,7 @@ mod native_window_tests {
         let main = profile_options(native_options(false, None, None, Geometry::default()));
         assert_eq!(
             main.persistence_path,
-            eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
+            eframe::storage_dir(spotifast::identity::SLUG).map(|dir| dir.join("app.ron"))
         );
         let demo_path = std::path::PathBuf::from("temporary/demo.ron");
         let demo = profile_options(demo_native_options(
@@ -1010,12 +1011,15 @@ mod native_window_tests {
             assert_eq!(mini.viewport.app_id, main.viewport.app_id);
             assert_eq!(
                 main.persistence_path,
-                eframe::storage_dir("spotifast").map(|dir| dir.join("app.ron"))
+                eframe::storage_dir(spotifast::identity::SLUG).map(|dir| dir.join("app.ron"))
             );
         }
         #[cfg(not(target_os = "linux"))]
         {
-            assert_eq!(main.viewport.app_id.as_deref(), Some("spotifast"));
+            assert_eq!(
+                main.viewport.app_id.as_deref(),
+                Some(spotifast::identity::SLUG)
+            );
             assert_eq!(mini.viewport.app_id, main.viewport.app_id);
             assert_eq!(main.persistence_path, None);
         }

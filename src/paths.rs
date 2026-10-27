@@ -14,7 +14,12 @@ use std::path::PathBuf;
 /// logs of its runs.
 const FOLDERS: fastframe_dirs::App = fastframe_dirs::App {
     not_copied: &["instance", "spotifast.log", "panic.log"],
-    ..fastframe_dirs::App::new("spotifast", "me", "paolino", "spotifast")
+    ..fastframe_dirs::App::new(
+        crate::identity::SLUG,
+        "io.github",
+        "krolebord",
+        crate::identity::SLUG,
+    )
 };
 
 #[derive(Clone, Debug)]
@@ -99,7 +104,7 @@ impl AppDirs {
         let fallback = std::env::current_dir().unwrap_or_default();
         Self {
             config: fallback.join("spotifast-config"),
-            state: fallback.join("spotifast-state"),
+            state: fallback.join("spotifast-soloist-state"),
             cache: fallback.join("spotifast-cache"),
         }
     }
@@ -331,11 +336,13 @@ mod tests {
         );
     }
 
-    /// Installed copies, and every copy on Linux and macOS, keep the folders
-    /// they always had.
+    /// Installed copies, and every copy on Linux and macOS, keep folders of
+    /// their own, apart from upstream Spotifast's.
     #[test]
-    fn the_per_user_folders_are_the_ones_spotifast_always_used() {
-        let Some(project) = directories::ProjectDirs::from("me", "paolino", "spotifast") else {
+    fn the_per_user_folders_are_spotifast_soloists_own() {
+        let Some(project) =
+            directories::ProjectDirs::from("io.github", "krolebord", crate::identity::SLUG)
+        else {
             return;
         };
         let dirs = AppDirs::installed();

@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Spotifast Soloist
+GenericName=Music Player
+Comment=A native Spotify client, playing through Spotify Soloist
+Exec=spotifast-soloist %u
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=spotify;music;player;streaming;spotifast;soloist;
+Icon=spotifast-soloist
+StartupNotify=true
+StartupWMClass=spotifast-soloist
+MimeType=x-scheme-handler/spotify;

@@ -16,7 +16,7 @@ fn packaging(file: &str) -> String {
 
 #[test]
 fn the_bundle_carries_the_agent_that_starts_in_the_tray() {
-    let id = "rocks.spotifast.Spotifast";
+    let id = spotifast::identity::BUNDLE_ID;
     assert_eq!(
         packaging("autostart.plist"),
         fastframe_autostart::macos_agent_plist(id, fastframe_autostart::START_HIDDEN),

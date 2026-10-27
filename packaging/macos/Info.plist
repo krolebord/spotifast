@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>Spotifast</string>
-    <key>CFBundleDisplayName</key><string>Spotifast</string>
+    <key>CFBundleName</key><string>__NAME__</string>
+    <key>CFBundleDisplayName</key><string>__NAME__</string>
     <key>CFBundleIdentifier</key><string>__IDENTIFIER__</string>
     <key>CFBundleExecutable</key><string>__EXECUTABLE__</string>
     <key>CFBundleIconFile</key><string>spotifast</string>

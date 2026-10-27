@@ -207,7 +207,7 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
     ui.add_space(6.0);
     theme::text(
         ui,
-        "Spotifast",
+        crate::identity::NAME,
         theme::bold(if steps { 26.0 } else { 30.0 }),
         palette.text,
     );
